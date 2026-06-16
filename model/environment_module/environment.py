@@ -38,8 +38,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 import copy
 import json
+import logging
+import time
 
 import numpy as np
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +224,8 @@ class PyRosettaPoseBackend:
         if minimization_tolerance <= 0:
             raise ValueError("minimization_tolerance must be > 0.")
 
+        started = time.perf_counter()
+        LOGGER.info("Importing PyRosetta backend options=%s", pyrosetta_init_options)
         try:
             import pyrosetta
         except ImportError as exc:  # pragma: no cover - needs PyRosetta install.
@@ -229,9 +236,16 @@ class PyRosettaPoseBackend:
 
         self.pyrosetta = pyrosetta
         self._initialize_pyrosetta_once(pyrosetta, pyrosetta_init_options)
+        LOGGER.info("PyRosetta initialized; building/getting score function")
         self.scorefxn = scorefxn if scorefxn is not None else pyrosetta.get_fa_scorefxn()
         self.minimization_type = str(minimization_type)
         self.minimization_tolerance = float(minimization_tolerance)
+        LOGGER.info(
+            "PyRosetta backend ready minimization_type=%s tolerance=%s elapsed_sec=%.3f",
+            self.minimization_type,
+            self.minimization_tolerance,
+            time.perf_counter() - started,
+        )
 
     @staticmethod
     def _initialize_pyrosetta_once(pyrosetta: Any, options: str) -> None:
@@ -241,13 +255,25 @@ class PyRosettaPoseBackend:
             already_initialized = False
 
         if not already_initialized:
+            LOGGER.info("Calling pyrosetta.init options=%s", options)
             pyrosetta.init(str(options))
+        else:
+            LOGGER.info("PyRosetta was already initialized; skipping pyrosetta.init")
 
     def load_pose(self, pdb_path: str) -> Any:
         path = Path(pdb_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Initial PDB file does not exist: {path}")
-        return self.pyrosetta.pose_from_pdb(str(path))
+        started = time.perf_counter()
+        LOGGER.info("Loading pose from PDB path=%s", path)
+        pose = self.pyrosetta.pose_from_pdb(str(path))
+        LOGGER.info(
+            "Loaded pose path=%s residues=%s elapsed_sec=%.3f",
+            path,
+            int(pose.total_residue()),
+            time.perf_counter() - started,
+        )
+        return pose
 
     @staticmethod
     def clone_pose(pose: Any) -> Any:
@@ -269,6 +295,7 @@ class PyRosettaPoseBackend:
         if radius <= 0:
             raise ValueError("radius must be > 0.")
 
+        started = time.perf_counter()
         total = self.total_residue(pose)
         center_position = int(center_position)
         if not 1 <= center_position <= total:
@@ -286,7 +313,15 @@ class PyRosettaPoseBackend:
         if center_position not in neighborhood:
             neighborhood.append(center_position)
 
-        return tuple(sorted(set(neighborhood)))
+        result = tuple(sorted(set(neighborhood)))
+        LOGGER.info(
+            "Computed local residues center=%s radius=%s count=%s elapsed_sec=%.3f",
+            center_position,
+            radius,
+            len(result),
+            time.perf_counter() - started,
+        )
+        return result
 
     @staticmethod
     def mutate(pose: Any, position: int, amino_acid: str) -> None:
@@ -299,12 +334,22 @@ class PyRosettaPoseBackend:
         mover = MutateResidue()
         mover.set_target(int(position))
         mover.set_res_name(AA_ONE_TO_THREE[amino_acid])
+        started = time.perf_counter()
+        LOGGER.info("Applying mutation position=%s amino_acid=%s", position, amino_acid)
         mover.apply(pose)
+        LOGGER.info(
+            "Applied mutation position=%s amino_acid=%s elapsed_sec=%.3f",
+            position,
+            amino_acid,
+            time.perf_counter() - started,
+        )
 
     def repack(self, pose: Any, local_residues: Sequence[int]) -> None:
         from pyrosetta import standard_packer_task
         from pyrosetta.rosetta.protocols.minimization_packing import PackRotamersMover
 
+        started = time.perf_counter()
+        LOGGER.info("Starting local repack local_residue_count=%s", len(local_residues))
         allowed = {int(index) for index in local_residues}
         task = standard_packer_task(pose)
         task.restrict_to_repacking()
@@ -315,6 +360,11 @@ class PyRosettaPoseBackend:
 
         mover = PackRotamersMover(self.scorefxn, task)
         mover.apply(pose)
+        LOGGER.info(
+            "Finished local repack local_residue_count=%s elapsed_sec=%.3f",
+            len(local_residues),
+            time.perf_counter() - started,
+        )
 
     def minimize(
         self,
@@ -326,6 +376,12 @@ class PyRosettaPoseBackend:
         from pyrosetta.rosetta.core.kinematics import MoveMap
         from pyrosetta.rosetta.protocols.minimization_packing import MinMover
 
+        started = time.perf_counter()
+        LOGGER.info(
+            "Starting local minimization local_residue_count=%s minimize_backbone=%s",
+            len(local_residues),
+            minimize_backbone,
+        )
         move_map = MoveMap()
         move_map.set_bb(False)
         move_map.set_chi(False)
@@ -342,12 +398,20 @@ class PyRosettaPoseBackend:
         mover.min_type(self.minimization_type)
         mover.tolerance(self.minimization_tolerance)
         mover.apply(pose)
+        LOGGER.info(
+            "Finished local minimization local_residue_count=%s minimize_backbone=%s elapsed_sec=%.3f",
+            len(local_residues),
+            minimize_backbone,
+            time.perf_counter() - started,
+        )
 
     @staticmethod
     def dump_pose(pose: Any, output_path: str) -> None:
         path = Path(output_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Dumping pose to PDB path=%s", path)
         pose.dump_pdb(str(path))
+        LOGGER.info("Dumped pose to PDB path=%s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +538,13 @@ class MechanicalProteinEnv(_GymEnvBase):
         pyrosetta_init_options: str = "-mute all",
         seed: Optional[int] = None,
     ) -> None:
+        started = time.perf_counter()
+        LOGGER.info(
+            "Initializing MechanicalProteinEnv initial_pdb=%s max_steps=%s seed=%s",
+            initial_pdb_path,
+            max_steps,
+            seed,
+        )
         if int(max_steps) <= 0:
             raise ValueError("max_steps must be a positive integer.")
         if float(local_repack_radius) <= 0:
@@ -581,6 +652,16 @@ class MechanicalProteinEnv(_GymEnvBase):
             high=1.0 if self.observation_encoder is None else np.inf,
             shape=initial_observation.shape,
             dtype=np.float32,
+        )
+        LOGGER.info(
+            "MechanicalProteinEnv ready residues=%s mutable_positions=%s action_dim=%s "
+            "observation_shape=%s max_steps=%s elapsed_sec=%.3f",
+            self.total_residues,
+            self.n_mutable_positions,
+            self.n_actions,
+            initial_observation.shape,
+            self.max_steps,
+            time.perf_counter() - started,
         )
 
     # ------------------------------------------------------------------
@@ -750,6 +831,7 @@ class MechanicalProteinEnv(_GymEnvBase):
             if hasattr(self.action_space, "seed"):
                 self.action_space.seed(seed)
 
+        LOGGER.info("Environment reset started seed=%s", seed)
         self.current_pose = self.backend.clone_pose(self.reference_pose)
         self.current_step = 0
         self.accepted_mutation_count = 0
@@ -760,6 +842,12 @@ class MechanicalProteinEnv(_GymEnvBase):
         observation = self._encode_observation()
         info = self._base_info()
         info["event"] = "reset"
+        LOGGER.info(
+            "Environment reset complete valid_actions=%s sequence=%s mutable_sequence=%s",
+            info.get("valid_action_count"),
+            info.get("sequence"),
+            info.get("mutable_sequence"),
+        )
         return observation, info
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -768,7 +856,15 @@ class MechanicalProteinEnv(_GymEnvBase):
         if self._episode_finalized:
             raise RuntimeError("Episode is finalized. Call reset() before step().")
 
+        step_started = time.perf_counter()
         decoded = self.decode_action(action)
+        LOGGER.info(
+            "Environment step started step_index=%s action=%s pose_position=%s target_amino_acid=%s",
+            self.current_step + 1,
+            action,
+            decoded.pose_position,
+            decoded.target_amino_acid,
+        )
         invalid_reason = self._invalid_reason(decoded)
         step_reward_result: Optional[Any] = None
         accepted = False
@@ -778,9 +874,20 @@ class MechanicalProteinEnv(_GymEnvBase):
         if invalid_reason is not None:
             step_reward = self.invalid_action_penalty
             reason = invalid_reason
+            LOGGER.info(
+                "Environment action rejected action=%s reason=%s penalty=%.6f",
+                action,
+                reason,
+                step_reward,
+            )
         else:
             previous_pose = self.backend.clone_pose(self.current_pose)
             candidate_pose = self.backend.clone_pose(self.current_pose)
+            LOGGER.info(
+                "Environment candidate pose cloned for action=%s pose_position=%s",
+                action,
+                decoded.pose_position,
+            )
             local_residues = self.backend.local_residues(
                 candidate_pose,
                 decoded.pose_position,
@@ -811,18 +918,35 @@ class MechanicalProteinEnv(_GymEnvBase):
                     local_residues=local_residues,
                 )
                 step_reward = self.step_reward_scale * float(step_reward_result.reward)
+                LOGGER.info(
+                    "Step reward evaluated raw_reward=%.6f scaled_reward=%.6f metrics=%s",
+                    float(step_reward_result.reward),
+                    float(step_reward),
+                    self._result_to_dict(step_reward_result),
+                )
 
             except Exception as exc:
                 if self.raise_on_update_error:
+                    LOGGER.exception("Environment structure update failed and will be raised")
                     raise
                 step_reward = self.update_error_penalty
                 reason = "structure_update_error"
                 error_message = f"{type(exc).__name__}: {exc}"
+                LOGGER.warning(
+                    "Environment structure update failed but training continues penalty=%.6f error=%s",
+                    step_reward,
+                    error_message,
+                )
             else:
                 self.current_pose = candidate_pose
                 self.visited_positions.add(decoded.pose_position)
                 self.accepted_mutation_count += 1
                 accepted = True
+                LOGGER.info(
+                    "Environment mutation accepted pose_position=%s accepted_mutation_count=%s",
+                    decoded.pose_position,
+                    self.accepted_mutation_count,
+                )
 
         self.current_step += 1
         terminated = False
@@ -843,6 +967,10 @@ class MechanicalProteinEnv(_GymEnvBase):
         terminal_reward = 0.0
         terminal_reward_result: Optional[Any] = None
         if truncated:
+            LOGGER.info(
+                "Environment episode truncation detected reason=%s; finalizing terminal reward",
+                truncation_reason,
+            )
             terminal_reward, terminal_reward_result = self._finalize_episode()
 
         total_reward = float(step_reward + terminal_reward)
@@ -878,6 +1006,21 @@ class MechanicalProteinEnv(_GymEnvBase):
             )
         )
 
+        LOGGER.info(
+            "Environment step complete step_index=%s total_reward=%.6f step_reward=%.6f "
+            "terminal_reward=%.6f accepted=%s reason=%s terminated=%s truncated=%s "
+            "valid_actions=%s elapsed_sec=%.3f",
+            self.current_step,
+            total_reward,
+            float(step_reward),
+            float(terminal_reward),
+            accepted,
+            reason,
+            terminated,
+            truncated,
+            info.get("valid_action_count"),
+            time.perf_counter() - step_started,
+        )
         return observation, total_reward, terminated, truncated, info
 
     def finalize_episode(self) -> Tuple[float, Dict[str, Any]]:
@@ -893,14 +1036,26 @@ class MechanicalProteinEnv(_GymEnvBase):
 
     def _finalize_episode(self) -> Tuple[float, Optional[Any]]:
         if self._episode_finalized:
+            LOGGER.info("Episode already finalized; terminal reward is not recalculated")
             return 0.0, None
 
         self._episode_finalized = True
         if self.terminal_reward_calculator is None:
+            LOGGER.info("No terminal_reward_calculator configured; terminal reward=0")
             return 0.0, None
 
+        started = time.perf_counter()
+        LOGGER.info("Evaluating terminal reward")
         result = self.terminal_reward_calculator.evaluate_pose(self.current_pose)
-        return self.terminal_reward_scale * float(result.reward), result
+        reward = self.terminal_reward_scale * float(result.reward)
+        LOGGER.info(
+            "Terminal reward evaluated raw_reward=%.6f scaled_reward=%.6f elapsed_sec=%.3f metrics=%s",
+            float(result.reward),
+            reward,
+            time.perf_counter() - started,
+            self._result_to_dict(result),
+        )
+        return reward, result
 
     # ------------------------------------------------------------------
     # Logging and output helpers
@@ -933,7 +1088,9 @@ class MechanicalProteinEnv(_GymEnvBase):
     def save_current_pose(self, output_path: str) -> None:
         """Write the current candidate structure to a PDB file."""
 
+        LOGGER.info("Saving current environment pose path=%s", output_path)
         self.backend.dump_pose(self.current_pose, output_path)
+        LOGGER.info("Saved current environment pose path=%s", output_path)
 
     def save_history(self, output_path: str) -> None:
         """Write the current episode transition log to JSON."""

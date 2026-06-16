@@ -7,6 +7,7 @@ can invalidate actions such as mutating a residue to its current amino acid.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
@@ -14,6 +15,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
 PathLike = Union[str, Path]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,15 @@ class ReplayBuffer:
         self._rng = np.random.default_rng(seed)
         self._position = 0
         self._size = 0
+        LOGGER.info(
+            "ReplayBuffer initialized capacity=%s state_shape=%s action_dim=%s "
+            "store_action_masks=%s seed=%s",
+            self.capacity,
+            self.state_shape,
+            self.action_dim,
+            self.store_action_masks,
+            seed,
+        )
 
         self._states = np.empty((self.capacity, *self.state_shape), dtype=self.state_dtype)
         self._next_states = np.empty((self.capacity, *self.state_shape), dtype=self.state_dtype)
@@ -188,6 +199,18 @@ class ReplayBuffer:
 
         self._position = (self._position + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
+        LOGGER.info(
+            "ReplayBuffer added transition index=%s action=%s reward=%.6f "
+            "terminated=%s truncated=%s done=%s size=%s next_position=%s",
+            index,
+            action_value,
+            reward_value,
+            terminated_value,
+            truncated_value,
+            done_value,
+            self._size,
+            self._position,
+        )
 
     def sample(self, batch_size: int, *, replace: bool = False) -> ReplayBatch:
         """Uniformly sample a mini-batch."""
@@ -201,6 +224,13 @@ class ReplayBuffer:
 
         indices = self._rng.choice(self._size, size=batch_size, replace=replace)
         indices = np.asarray(indices, dtype=np.int64)
+        LOGGER.info(
+            "ReplayBuffer sampled batch_size=%s replace=%s size=%s indices_preview=%s",
+            batch_size,
+            replace,
+            self._size,
+            indices[: min(10, len(indices))].tolist(),
+        )
 
         return ReplayBatch(
             states=self._states[indices].copy(),
@@ -291,6 +321,7 @@ class ReplayBuffer:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("ReplayBuffer save started path=%s size=%s capacity=%s", path, self._size, self.capacity)
         payload = self.state_dict()
         metadata = {
             key: payload[key]
@@ -315,6 +346,7 @@ class ReplayBuffer:
             if payload["next_action_masks"] is None
             else payload["next_action_masks"],
         )
+        LOGGER.info("ReplayBuffer save complete path=%s", path)
 
     @classmethod
     def load(cls, path: PathLike) -> "ReplayBuffer":
@@ -324,6 +356,7 @@ class ReplayBuffer:
         if not path.exists():
             raise FileNotFoundError(f"Replay-buffer snapshot not found: {path}")
 
+        LOGGER.info("ReplayBuffer load started path=%s", path)
         with np.load(path, allow_pickle=True) as archive:
             metadata = archive["metadata"].item()
             buffer = cls(
@@ -347,6 +380,7 @@ class ReplayBuffer:
                 next_action_masks=archive["next_action_masks"] if buffer.store_action_masks else None,
             )
             buffer.load_state_dict(payload)
+            LOGGER.info("ReplayBuffer load complete path=%s size=%s capacity=%s", path, len(buffer), buffer.capacity)
             return buffer
 
     @staticmethod
