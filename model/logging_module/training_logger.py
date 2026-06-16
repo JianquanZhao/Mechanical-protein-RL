@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import warnings
 from dataclasses import asdict, dataclass, is_dataclass
@@ -51,6 +52,7 @@ import numpy as np
 
 
 PathLike = Union[str, Path]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,7 @@ class TrainingLogger:
         *,
         tensorboard_writer: Optional[Any] = None,
     ) -> None:
+        LOGGER.info("Initializing TrainingLogger config=%s", asdict(config))
         config.validate()
         self.config = config
 
@@ -159,12 +162,25 @@ class TrainingLogger:
             )
             if config.save_step_records:
                 self.step_records = self._read_jsonl(self.steps_jsonl_path)
+            LOGGER.info(
+                "TrainingLogger resumed records episodes=%s optimizations=%s steps=%s",
+                len(self.episode_records),
+                len(self.optimization_records),
+                len(self.step_records),
+            )
 
         self._writer = tensorboard_writer
         if self._writer is None and config.enable_tensorboard:
             self._writer = self._create_tensorboard_writer()
 
         self._closed = False
+        LOGGER.info(
+            "TrainingLogger ready output_dir=%s logs_dir=%s plots_dir=%s tensorboard=%s",
+            self.output_dir,
+            self.logs_dir,
+            self.plots_dir,
+            self._writer is not None,
+        )
 
     # ------------------------------------------------------------------
     # Public logging API
@@ -209,6 +225,13 @@ class TrainingLogger:
             )
         )
         self._tensorboard_add_scalars("optimization", record, tensorboard_step)
+        LOGGER.info(
+            "Logged optimization record optimization_step=%s global_step=%s loss=%s path=%s",
+            record.get("optimization_step"),
+            record.get("global_step"),
+            record.get("loss"),
+            self.optimization_jsonl_path,
+        )
         return record
 
     def log_step(
@@ -298,6 +321,16 @@ class TrainingLogger:
                 record["global_step"],
             )
 
+        LOGGER.info(
+            "Logged step record episode=%s episode_step=%s global_step=%s reward=%.6f "
+            "done=%s path=%s",
+            record["episode"],
+            record["episode_step"],
+            record["global_step"],
+            record["reward"],
+            record["done"],
+            self.steps_jsonl_path,
+        )
         return record
 
     def end_episode(
@@ -355,6 +388,14 @@ class TrainingLogger:
         self.episode_records.append(record)
         self._append_jsonl(self.episodes_jsonl_path, record)
         self._write_episode_csv()
+        LOGGER.info(
+            "Logged episode record episode=%s total_reward=%.6f steps=%s path=%s csv=%s",
+            record["episode"],
+            record["total_reward"],
+            record["episode_steps"],
+            self.episodes_jsonl_path,
+            self.episodes_csv_path,
+        )
 
         self._tensorboard_add_scalar(
             "episode/total_reward",
@@ -384,7 +425,8 @@ class TrainingLogger:
             )
 
         if generate_plots:
-            self.generate_plots()
+            paths = self.generate_plots()
+            LOGGER.info("Generated periodic plots count=%s paths=%s", len(paths), paths)
 
         return record
 
@@ -399,6 +441,13 @@ class TrainingLogger:
         Separate figures are deliberately used to keep each signal readable.
         """
 
+        LOGGER.info(
+            "Generating plots episodes=%s optimizations=%s steps=%s output_dir=%s",
+            len(self.episode_records),
+            len(self.optimization_records),
+            len(self.step_records),
+            self.plots_dir,
+        )
         plt = self._import_pyplot()
         output_paths: Dict[str, Path] = {}
 
@@ -582,6 +631,7 @@ class TrainingLogger:
             )
 
         self.flush()
+        LOGGER.info("Plot generation complete count=%s paths=%s", len(output_paths), output_paths)
         return output_paths
 
     @staticmethod
@@ -621,14 +671,18 @@ class TrainingLogger:
     def flush(self) -> None:
         if self._writer is not None and hasattr(self._writer, "flush"):
             self._writer.flush()
+            LOGGER.info("TrainingLogger tensorboard writer flushed")
 
     def close(self) -> None:
         if self._closed:
             return
+        LOGGER.info("Closing TrainingLogger")
         self.flush()
         if self._writer is not None and hasattr(self._writer, "close"):
             self._writer.close()
+            LOGGER.info("TrainingLogger tensorboard writer closed")
         self._closed = True
+        LOGGER.info("TrainingLogger closed")
 
     def __enter__(self) -> "TrainingLogger":
         return self
@@ -653,6 +707,7 @@ class TrainingLogger:
             return None
 
         self.tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Creating TensorBoard SummaryWriter dir=%s", self.tensorboard_dir)
         return SummaryWriter(
             log_dir=str(self.tensorboard_dir),
             flush_secs=self.config.tensorboard_flush_secs,
@@ -810,10 +865,12 @@ class TrainingLogger:
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
             file.write("\n")
+        LOGGER.info("Appended JSONL path=%s keys=%s", path, sorted(record.keys()))
 
     @staticmethod
     def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
         if not path.exists():
+            LOGGER.info("JSONL path does not exist; starting empty path=%s", path)
             return []
 
         records: List[Dict[str, Any]] = []
@@ -835,6 +892,7 @@ class TrainingLogger:
                         f"{line_number}."
                     )
                 records.append(value)
+        LOGGER.info("Read JSONL path=%s records=%s", path, len(records))
         return records
 
     def _write_episode_csv(self) -> None:
@@ -877,6 +935,11 @@ class TrainingLogger:
             writer.writeheader()
             for record in self.episode_records:
                 writer.writerow(record)
+        LOGGER.info(
+            "Wrote episode CSV path=%s rows=%s",
+            self.episodes_csv_path,
+            len(self.episode_records),
+        )
 
     @classmethod
     def _normalize_record(cls, value: Any) -> Dict[str, Any]:

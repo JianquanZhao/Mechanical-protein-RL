@@ -23,6 +23,8 @@ whose arrays follow the interface implemented by replay_buffer_module.
 from __future__ import annotations
 
 import copy
+import logging
+import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -35,6 +37,7 @@ from torch.nn import functional as F
 
 
 PathLike = Union[str, Path]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -193,12 +196,20 @@ class DDQNAgent:
         online_network: Optional[nn.Module] = None,
         target_network: Optional[nn.Module] = None,
     ) -> None:
+        started = time.perf_counter()
+        LOGGER.info(
+            "Initializing DDQNAgent state_shape=%s action_dim=%s config=%s",
+            tuple(state_shape),
+            action_dim,
+            asdict(config),
+        )
         config.validate()
 
         self.state_shape = _validate_state_shape(state_shape)
         self.action_dim = _validate_positive_int(action_dim, "action_dim")
         self.config = config
         self.device = self._resolve_device(config.device)
+        LOGGER.info("DDQNAgent resolved device=%s", self.device)
         self._rng = np.random.default_rng(config.seed)
 
         self.online_network = (
@@ -235,6 +246,13 @@ class DDQNAgent:
 
         self.environment_steps = 0
         self.optimization_steps = 0
+        LOGGER.info(
+            "DDQNAgent ready device=%s amp_enabled=%s effective_batch_size=%s elapsed_sec=%.3f",
+            self.device,
+            self.amp_enabled,
+            self.config.effective_batch_size,
+            time.perf_counter() - started,
+        )
 
     # ------------------------------------------------------------------
     # Action selection
@@ -277,6 +295,7 @@ class DDQNAgent:
 
         if use_random_action:
             action = int(self._rng.choice(valid_actions))
+            selection_mode = "random"
         else:
             with torch.no_grad():
                 state_tensor = torch.as_tensor(
@@ -292,10 +311,21 @@ class DDQNAgent:
                 ).unsqueeze(0)
                 masked_q_values = self.mask_invalid_q_values(q_values, mask_tensor)
                 action = int(masked_q_values.argmax(dim=1).item())
+            selection_mode = "greedy"
 
         if not evaluate and advance_step:
             self.environment_steps += 1
 
+        LOGGER.info(
+            "DDQNAgent selected action=%s mode=%s evaluate=%s epsilon=%.6f "
+            "valid_actions=%s environment_steps=%s",
+            action,
+            selection_mode,
+            evaluate,
+            self.epsilon,
+            valid_actions.size,
+            self.environment_steps,
+        )
         return action
 
     @staticmethod
@@ -401,8 +431,18 @@ class DDQNAgent:
             self.config.effective_batch_size,
         )
         if len(replay_buffer) < required_size:
+            LOGGER.info(
+                "DDQN optimization waiting for replay warmup buffer_size=%s required_size=%s",
+                len(replay_buffer),
+                required_size,
+            )
             return None
 
+        LOGGER.info(
+            "DDQN sampling replay batch batch_size=%s buffer_size=%s",
+            self.config.effective_batch_size,
+            len(replay_buffer),
+        )
         batch = replay_buffer.sample(self.config.effective_batch_size)
         return self.optimize_batch(batch)
 
@@ -411,8 +451,16 @@ class DDQNAgent:
         Optimize the online network using micro-batch gradient accumulation.
         """
 
+        optimize_started = time.perf_counter()
         arrays = self._coerce_replay_batch(batch)
         total_size = int(arrays["actions"].shape[0])
+        LOGGER.info(
+            "DDQN optimize_batch started total_size=%s micro_batch_size=%s device=%s amp=%s",
+            total_size,
+            self.config.micro_batch_size,
+            self.device,
+            self.amp_enabled,
+        )
 
         self.online_network.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -426,6 +474,13 @@ class DDQNAgent:
         for start in range(0, total_size, self.config.micro_batch_size):
             stop = min(start + self.config.micro_batch_size, total_size)
             micro_batches += 1
+            micro_started = time.perf_counter()
+            LOGGER.debug(
+                "DDQN micro-batch started index=%s start=%s stop=%s",
+                micro_batches,
+                start,
+                stop,
+            )
 
             states = self._tensor(arrays["states"][start:stop], torch.float32)
             actions = self._tensor(arrays["actions"][start:stop], torch.long)
@@ -478,6 +533,13 @@ class DDQNAgent:
             total_q_sum += float(selected_q_values.detach().sum().item())
             total_target_sum += float(td_targets.detach().sum().item())
             total_absolute_td_error_sum += float(td_errors.abs().sum().item())
+            LOGGER.debug(
+                "DDQN micro-batch complete index=%s rows=%s loss_sum=%.8f elapsed_sec=%.3f",
+                micro_batches,
+                stop - start,
+                float(loss_sum.detach().item()),
+                time.perf_counter() - micro_started,
+            )
 
         if self.amp_enabled:
             self._grad_scaler.unscale_(self.optimizer)
@@ -493,6 +555,7 @@ class DDQNAgent:
 
         if not np.isfinite(grad_norm):
             self.optimizer.zero_grad(set_to_none=True)
+            LOGGER.error("DDQN gradient norm is non-finite grad_norm=%s", grad_norm)
             raise FloatingPointError(
                 "Gradient norm is NaN or infinity. "
                 "Inspect rewards, Q values and learning rate."
@@ -503,6 +566,7 @@ class DDQNAgent:
             self._grad_scaler.update()
         else:
             self.optimizer.step()
+        LOGGER.info("DDQN optimizer step applied grad_norm=%.8f", grad_norm)
 
         self.optimization_steps += 1
 
@@ -510,8 +574,9 @@ class DDQNAgent:
         if self.optimization_steps % self.config.target_sync_interval == 0:
             self.hard_sync_target_network()
             target_synced = True
+            LOGGER.info("DDQN hard target sync triggered optimization_step=%s", self.optimization_steps)
 
-        return OptimizationResult(
+        result = OptimizationResult(
             loss=total_loss_sum / total_size,
             mean_q_value=total_q_sum / total_size,
             mean_target_q_value=total_target_sum / total_size,
@@ -523,6 +588,20 @@ class DDQNAgent:
             target_synced=target_synced,
             epsilon=self.epsilon,
         )
+        LOGGER.info(
+            "DDQN optimize_batch complete optimization_step=%s loss=%.8f "
+            "mean_q=%.8f mean_target=%.8f mean_abs_td=%.8f micro_batches=%s "
+            "target_synced=%s elapsed_sec=%.3f",
+            result.optimization_step,
+            result.loss,
+            result.mean_q_value,
+            result.mean_target_q_value,
+            result.mean_absolute_td_error,
+            result.micro_batches,
+            result.target_synced,
+            time.perf_counter() - optimize_started,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Target-network lifecycle
@@ -531,8 +610,10 @@ class DDQNAgent:
     def hard_sync_target_network(self) -> None:
         """Copy all online-network weights into the target network."""
 
+        LOGGER.info("DDQN hard target sync started")
         self.target_network.load_state_dict(self.online_network.state_dict())
         self.target_network.eval()
+        LOGGER.info("DDQN hard target sync complete")
 
     def soft_sync_target_network(self, tau: float) -> None:
         """Polyak update: target <- tau * online + (1 - tau) * target."""
@@ -603,7 +684,9 @@ class DDQNAgent:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("DDQN save_checkpoint started path=%s", path)
         torch.save(self.state_dict(), path)
+        LOGGER.info("DDQN save_checkpoint complete path=%s", path)
 
     @classmethod
     def from_checkpoint(
