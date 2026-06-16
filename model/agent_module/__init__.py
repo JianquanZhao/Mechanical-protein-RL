@@ -1,2 +1,15 @@
-from .ddqn_agent import DDQNAgent, DDQNConfig, OptimizationResult, QNetwork
-__all__ = ['DDQNAgent', 'DDQNConfig', 'OptimizationResult', 'QNetwork']
+from .ddqn_agent import (
+    DDQNAgent,
+    DDQNConfig,
+    OptimizationResult,
+    QNetwork,
+    SUPPORTED_PROTEIN_EMBEDDING_DIMS,
+)
+
+__all__ = [
+    "DDQNAgent",
+    "DDQNConfig",
+    "OptimizationResult",
+    "QNetwork",
+    "SUPPORTED_PROTEIN_EMBEDDING_DIMS",
+]

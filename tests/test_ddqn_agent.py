@@ -10,6 +10,7 @@ from model.agent_module.ddqn_agent import (
     DDQNAgent,
     DDQNConfig,
     QNetwork,
+    SUPPORTED_PROTEIN_EMBEDDING_DIMS,
 )
 
 
@@ -114,12 +115,31 @@ def test_q_network_output_shape_and_single_state_support() -> None:
     network = QNetwork((6,), action_dim=5, hidden_dims=(8, 4))
     assert network(torch.zeros(3, 6)).shape == (3, 5)
     assert network(torch.zeros(6)).shape == (1, 5)
+    assert network.embedding_dim == 1280
 
 
 def test_q_network_rejects_wrong_state_shape() -> None:
     network = QNetwork((6,), action_dim=5, hidden_dims=(8,))
     with pytest.raises(ValueError, match="Expected trailing state shape"):
         network(torch.zeros(3, 5))
+
+
+def test_q_network_accepts_protein_embedding_dimensions() -> None:
+    for embedding_dim in SUPPORTED_PROTEIN_EMBEDDING_DIMS:
+        network = QNetwork(
+            (embedding_dim,),
+            action_dim=3,
+            hidden_dims=(8,),
+            embedding_dim=embedding_dim,
+        )
+        assert network(torch.zeros(2, embedding_dim)).shape == (2, 3)
+
+
+def test_q_network_projects_legacy_observation_to_embedding_space() -> None:
+    network = QNetwork((6,), action_dim=5, hidden_dims=(8,), embedding_dim=1280)
+    assert isinstance(network.input_projection, nn.Linear)
+    assert network.input_projection.out_features == 1280
+    assert network(torch.zeros(2, 6)).shape == (2, 5)
 
 
 def test_epsilon_schedule_is_linear_and_bounded() -> None:
@@ -453,6 +473,7 @@ def test_gradient_clipping_returns_finite_norm() -> None:
         {"epsilon_start": 0.1, "epsilon_end": 0.5},
         {"target_sync_interval": 0},
         {"max_grad_norm": 0.0},
+        {"embedding_dim": 64},
     ],
 )
 def test_config_validation(kwargs) -> None:
