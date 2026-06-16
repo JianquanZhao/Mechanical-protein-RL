@@ -38,6 +38,7 @@ from torch.nn import functional as F
 
 PathLike = Union[str, Path]
 LOGGER = logging.getLogger(__name__)
+SUPPORTED_PROTEIN_EMBEDDING_DIMS = (1280, 2560, 5120)
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class DDQNConfig:
     """Hyperparameters for DDQN training."""
 
     hidden_dims: Tuple[int, ...] = (256, 256)
+    embedding_dim: int = 1280
     gamma: float = 0.99
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
@@ -74,6 +76,11 @@ class DDQNConfig:
     def validate(self) -> None:
         if not self.hidden_dims or any(int(value) <= 0 for value in self.hidden_dims):
             raise ValueError("hidden_dims must contain positive integers.")
+        if int(self.embedding_dim) not in SUPPORTED_PROTEIN_EMBEDDING_DIMS:
+            raise ValueError(
+                "embedding_dim must be one of "
+                f"{SUPPORTED_PROTEIN_EMBEDDING_DIMS}."
+            )
         if not 0.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be within [0, 1].")
         if self.learning_rate <= 0:
@@ -121,7 +128,14 @@ class OptimizationResult:
 
 
 class QNetwork(nn.Module):
-    """Simple MLP Q-network for flattened observation vectors."""
+    """
+    Q head for protein-language-model encoded observations.
+
+    The preferred input is a fixed-size pooled protein embedding with trailing
+    dimension ``embedding_dim``. For compatibility with legacy one-hot
+    observations, any fixed ``state_shape`` is first projected into the selected
+    protein embedding space, then mapped to action Q values by the MLP head.
+    """
 
     def __init__(
         self,
@@ -129,17 +143,24 @@ class QNetwork(nn.Module):
         action_dim: int,
         *,
         hidden_dims: Sequence[int] = (256, 256),
+        embedding_dim: int = 1280,
     ) -> None:
         super().__init__()
 
         self.state_shape = _validate_state_shape(state_shape)
         self.action_dim = _validate_positive_int(action_dim, "action_dim")
+        self.embedding_dim = _validate_embedding_dim(embedding_dim)
         hidden_dims = tuple(int(value) for value in hidden_dims)
         if not hidden_dims or any(value <= 0 for value in hidden_dims):
             raise ValueError("hidden_dims must contain positive integers.")
 
         flattened_dim = int(np.prod(self.state_shape))
-        dimensions = (flattened_dim, *hidden_dims, self.action_dim)
+        if flattened_dim == self.embedding_dim:
+            self.input_projection = nn.Identity()
+        else:
+            self.input_projection = nn.Linear(flattened_dim, self.embedding_dim)
+
+        dimensions = (self.embedding_dim, *hidden_dims, self.action_dim)
 
         layers = []
         for input_dim, output_dim in zip(dimensions[:-2], dimensions[1:-1]):
@@ -167,7 +188,8 @@ class QNetwork(nn.Module):
             )
 
         flattened = states.reshape(states.shape[0], -1)
-        return self.network(flattened)
+        embedding = self.input_projection(flattened)
+        return self.network(embedding)
 
 
 class DDQNAgent:
@@ -217,6 +239,7 @@ class DDQNAgent:
                 self.state_shape,
                 self.action_dim,
                 hidden_dims=config.hidden_dims,
+                embedding_dim=config.embedding_dim,
             )
             if online_network is None
             else online_network
@@ -874,6 +897,16 @@ def _validate_state_shape(state_shape: Sequence[int]) -> Tuple[int, ...]:
     if not shape or any(value <= 0 for value in shape):
         raise ValueError("state_shape must contain positive dimensions.")
     return shape
+
+
+def _validate_embedding_dim(value: Any) -> int:
+    embedding_dim = int(value)
+    if embedding_dim not in SUPPORTED_PROTEIN_EMBEDDING_DIMS:
+        raise ValueError(
+            "embedding_dim must be one of "
+            f"{SUPPORTED_PROTEIN_EMBEDDING_DIMS}."
+        )
+    return embedding_dim
 
 
 def _torch_load(

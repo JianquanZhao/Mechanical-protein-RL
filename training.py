@@ -77,6 +77,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local-repack-radius", type=float, default=8.0)
     parser.add_argument("--pyrosetta-options", default="-mute all")
+    parser.add_argument(
+        "--observation-encoder",
+        choices=("default", "esm2"),
+        default="default",
+        help="Use default one-hot environment observations or pooled ESM2 embeddings.",
+    )
+    parser.add_argument(
+        "--esm2-device",
+        default="auto",
+        help="Device for ESM2 observation encoding when --observation-encoder esm2.",
+    )
+    parser.add_argument(
+        "--esm2-pool",
+        choices=("mean", "cls"),
+        default="mean",
+        help="Pooling method for ESM2 token representations.",
+    )
+    parser.add_argument(
+        "--esm2-mutable-only",
+        action="store_true",
+        help="Encode only mutable positions with ESM2 instead of the full sequence.",
+    )
     parser.add_argument("--no-repack", action="store_true")
     parser.add_argument("--no-minimize", action="store_true")
     parser.add_argument("--minimize-backbone", action="store_true")
@@ -90,6 +112,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--hidden-dims", default="256,256")
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        choices=(1280, 2560, 5120),
+        default=1280,
+        help="Protein-language-model encoding dimension used by the DDQN Q head.",
+    )
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -169,9 +198,27 @@ def parse_gpu_ids(value: Optional[str]) -> Tuple[int, ...]:
 
 
 def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
+    observation_encoder = None
+    if args.observation_encoder == "esm2":
+        from model.encoding_module import ESM2SequenceEncoder
+
+        LOGGER.info(
+            "Building ESM2 observation encoder embedding_dim=%s device=%s pool=%s mutable_only=%s",
+            args.embedding_dim,
+            args.esm2_device,
+            args.esm2_pool,
+            args.esm2_mutable_only,
+        )
+        observation_encoder = ESM2SequenceEncoder(
+            embedding_dim=args.embedding_dim,
+            device=args.esm2_device,
+            pool=args.esm2_pool,
+            mutable_only=args.esm2_mutable_only,
+        )
+
     LOGGER.info(
         "Building MechanicalProteinEnv initial_pdb=%s max_steps=%s mutable_positions=%s "
-        "repack=%s minimize=%s minimize_backbone=%s local_repack_radius=%s",
+        "repack=%s minimize=%s minimize_backbone=%s local_repack_radius=%s observation_encoder=%s",
         args.initial_pdb,
         args.max_steps,
         args.mutable_positions or "all canonical residues",
@@ -179,6 +226,7 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         not args.no_minimize,
         args.minimize_backbone,
         args.local_repack_radius,
+        args.observation_encoder,
     )
     return MechanicalProteinEnv(
         initial_pdb_path=args.initial_pdb,
@@ -193,6 +241,7 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         minimize_backbone=args.minimize_backbone,
         prevent_revisit_positions=args.prevent_revisit_positions,
         raise_on_update_error=args.raise_on_update_error,
+        observation_encoder=observation_encoder,
         pyrosetta_init_options=args.pyrosetta_options,
         seed=args.seed,
     )
@@ -201,6 +250,7 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
 def build_agent_config(args: argparse.Namespace, *, device: str) -> DDQNConfig:
     return DDQNConfig(
         hidden_dims=parse_hidden_dims(args.hidden_dims),
+        embedding_dim=args.embedding_dim,
         gamma=args.gamma,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
