@@ -244,3 +244,74 @@ def test_load_state_dict_rejects_incompatible_configuration() -> None:
     target = make_buffer(capacity=6)
     with pytest.raises(ValueError, match="incompatible"):
         target.load_state_dict(source.state_dict())
+
+
+def test_variable_length_sample_pads_states_and_masks() -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(2, 4),
+        action_dim=40,
+        seed=5,
+        variable_length=True,
+    )
+
+    short_state = np.ones((2, 4), dtype=np.float32)
+    long_state = np.full((3, 4), 2.0, dtype=np.float32)
+    buffer.add(
+        state=short_state,
+        action=1,
+        reward=1.0,
+        next_state=short_state + 0.5,
+        action_mask=np.ones(40, dtype=bool),
+        next_action_mask=np.ones(40, dtype=bool),
+    )
+    buffer.add(
+        state=long_state,
+        action=45,
+        reward=2.0,
+        next_state=long_state + 0.5,
+        action_mask=np.ones(60, dtype=bool),
+        next_action_mask=np.ones(60, dtype=bool),
+    )
+
+    batch = buffer.sample(2)
+
+    assert batch.states.shape == (2, 3, 4)
+    assert batch.next_states.shape == (2, 3, 4)
+    assert batch.action_masks is not None and batch.action_masks.shape == (2, 60)
+    assert batch.next_action_masks is not None and batch.next_action_masks.shape == (2, 60)
+
+    short_row = int(np.where(batch.actions == 1)[0][0])
+    long_row = int(np.where(batch.actions == 45)[0][0])
+    np.testing.assert_array_equal(batch.states[short_row, 2], np.zeros(4, dtype=np.float32))
+    assert not np.any(batch.action_masks[short_row, 40:])
+    assert np.all(batch.action_masks[long_row])
+
+
+def test_variable_length_save_and_load_round_trip(tmp_path: Path) -> None:
+    buffer = ReplayBuffer(
+        capacity=3,
+        state_shape=(2, 4),
+        action_dim=40,
+        seed=11,
+        variable_length=True,
+    )
+    state = np.ones((2, 4), dtype=np.float32)
+    buffer.add(
+        state=state,
+        action=3,
+        reward=1.0,
+        next_state=state,
+        action_mask=np.ones(40, dtype=bool),
+        next_action_mask=np.ones(40, dtype=bool),
+    )
+
+    path = tmp_path / "variable_replay.npz"
+    buffer.save(path)
+    restored = ReplayBuffer.load(path)
+
+    assert restored.variable_length
+    assert restored.state_shape == buffer.state_shape
+    batch = restored.sample(1)
+    assert batch.states.shape == (1, 2, 4)
+    assert batch.action_masks is not None and batch.action_masks.shape == (1, 40)
