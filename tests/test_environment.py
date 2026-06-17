@@ -114,6 +114,29 @@ def test_load_reset_and_default_observation_shape() -> None:
     assert info["valid_action_count"] == 3 * 19
 
 
+def test_reset_can_replace_episode_pdb_and_spaces() -> None:
+    class PathAwareBackend(FakeBackend):
+        def load_pose(self, pdb_path: str) -> FakePose:
+            self.calls.append(("load", pdb_path))
+            sequence = "ACD" if pdb_path == "short.pdb" else "ACDE"
+            return FakePose(list(sequence))
+
+    env = MechanicalProteinEnv(
+        backend=PathAwareBackend(),
+        step_reward_calculator=FakeStepRewardCalculator(),
+    )
+
+    short_observation, short_info = env.reset(pdb_path="short.pdb")
+    long_observation, long_info = env.reset(pdb_path="long.pdb")
+
+    assert short_info["sequence"] == "ACD"
+    assert short_observation.shape == (60,)
+    assert env.action_space.n == 80
+    assert long_info["sequence"] == "ACDE"
+    assert long_observation.shape == (80,)
+    assert long_info["valid_action_count"] == 4 * 19
+
+
 def test_decode_action_maps_mutable_index_and_amino_acid() -> None:
     env = make_env()
     env.reset()

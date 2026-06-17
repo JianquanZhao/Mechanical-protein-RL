@@ -1,7 +1,7 @@
 python training.py \
   --mode single \
   --device cuda:0 \
-  --episodes 2 \
+  --episodes 10 \
   --max-steps 1000 \
   --output-dir /tmp/mprl-variable-replay-smoke \
   --replay-warmup-size 1 \
@@ -9,4 +9,4 @@ python training.py \
   --gradient-accumulation-steps 2 \
   --checkpoint-every 2 \
   --no-resume-logs \
-  --log-level WARNING
+  --log-level INFO

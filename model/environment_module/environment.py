@@ -454,7 +454,8 @@ class MechanicalProteinEnv(_GymEnvBase):
     Parameters
     ----------
     initial_pdb_path:
-        Initial / wild-type PDB structure.
+        Optional initial / wild-type PDB structure. When omitted, pass a PDB
+        path to reset(pdb_path=...) or reset(options={"pdb_path": ...}).
     max_steps:
         Maximum number of mutation actions in one episode. Reaching max_steps
         returns truncated=True and triggers the optional terminal reward.
@@ -512,7 +513,7 @@ class MechanicalProteinEnv(_GymEnvBase):
 
     def __init__(
         self,
-        initial_pdb_path: str,
+        initial_pdb_path: Optional[str] = None,
         *,
         max_steps: int = 5,
         mutable_positions: Optional[Sequence[int]] = None,
@@ -559,7 +560,9 @@ class MechanicalProteinEnv(_GymEnvBase):
         if unknown:
             raise ValueError(f"Only canonical amino acids are supported: {unknown}.")
 
-        self.initial_pdb_path = str(Path(initial_pdb_path).expanduser())
+        self.initial_pdb_path = (
+            None if initial_pdb_path is None else str(Path(initial_pdb_path).expanduser())
+        )
         self.max_steps = int(max_steps)
         self.amino_acids = amino_acid_tuple
         self.n_amino_acids = len(self.amino_acids)
@@ -577,12 +580,65 @@ class MechanicalProteinEnv(_GymEnvBase):
         self.truncate_when_no_valid_actions = bool(truncate_when_no_valid_actions)
         self.observation_encoder = observation_encoder
         self.flatten_observation = bool(flatten_observation)
+        self._configured_mutable_positions = (
+            None if mutable_positions is None else tuple(int(index) for index in mutable_positions)
+        )
+        self._step_reward_calculator_override = step_reward_calculator
+        self._step_reward_kwargs = dict(step_reward_kwargs or {})
+        self.terminal_reward_calculator = terminal_reward_calculator
 
         self.backend: PoseBackend = (
             backend
             if backend is not None
             else PyRosettaPoseBackend(pyrosetta_init_options=pyrosetta_init_options)
         )
+
+        self.reference_pose: Any = None
+        self.current_pose: Any = None
+        self.total_residues = 0
+        self.mutable_positions: Tuple[int, ...] = tuple()
+        self.n_mutable_positions = 0
+        self.n_actions = 0
+        self.step_reward_calculator = step_reward_calculator
+
+        self.action_space = spaces.Discrete(1)
+        self._rng = np.random.default_rng(seed)
+        if hasattr(self.action_space, "seed"):
+            self.action_space.seed(seed)
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(1,),
+            dtype=np.float32,
+        )
+
+        self.current_step = 0
+        self.accepted_mutation_count = 0
+        self.visited_positions: set[int] = set()
+        self.history: List[TransitionRecord] = []
+        self._episode_finalized = False
+
+        if self.initial_pdb_path is not None:
+            self._load_episode_structure(self.initial_pdb_path)
+
+        LOGGER.info(
+            "MechanicalProteinEnv instantiated loaded=%s residues=%s mutable_positions=%s "
+            "action_dim=%s observation_shape=%s max_steps=%s elapsed_sec=%.3f",
+            self.current_pose is not None,
+            self.total_residues,
+            self.n_mutable_positions,
+            self.n_actions,
+            self.observation_space.shape,
+            self.max_steps,
+            time.perf_counter() - started,
+        )
+
+    def _load_episode_structure(self, pdb_path: str) -> None:
+        """Load a PDB and rebuild episode-specific spaces and reference state."""
+
+        load_started = time.perf_counter()
+        self.initial_pdb_path = str(Path(pdb_path).expanduser())
+        LOGGER.info("Loading episode structure pdb_path=%s", self.initial_pdb_path)
 
         loaded_pose = self.backend.load_pose(self.initial_pdb_path)
         self.reference_pose = self.backend.clone_pose(loaded_pose)
@@ -591,7 +647,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         if self.total_residues <= 0:
             raise ValueError("Initial pose contains no residues.")
 
-        if mutable_positions is None:
+        if self._configured_mutable_positions is None:
             # Exclude ligands and non-canonical residues from the default
             # mutation space. Users may still include selected positions
             # explicitly when a specialized workflow requires it.
@@ -607,7 +663,7 @@ class MechanicalProteinEnv(_GymEnvBase):
                     "Provide mutable_positions explicitly if this is intentional."
                 )
         else:
-            positions = tuple(int(index) for index in mutable_positions)
+            positions = self._configured_mutable_positions
             if not positions:
                 raise ValueError("mutable_positions must not be empty.")
             if len(set(positions)) != len(positions):
@@ -624,21 +680,18 @@ class MechanicalProteinEnv(_GymEnvBase):
         self.n_mutable_positions = len(self.mutable_positions)
         self.n_actions = self.n_mutable_positions * self.n_amino_acids
 
-        if step_reward_calculator is None:
+        if self._step_reward_calculator_override is None:
             calculator_class = _load_step_reward_calculator_class()
-            kwargs = dict(step_reward_kwargs or {})
+            kwargs = dict(self._step_reward_kwargs)
             if "scorefxn" not in kwargs and hasattr(self.backend, "scorefxn"):
                 kwargs["scorefxn"] = self.backend.scorefxn
             self.step_reward_calculator = calculator_class(self.reference_pose, **kwargs)
         else:
-            self.step_reward_calculator = step_reward_calculator
-
-        self.terminal_reward_calculator = terminal_reward_calculator
+            self.step_reward_calculator = self._step_reward_calculator_override
 
         self.action_space = spaces.Discrete(self.n_actions)
-        self._rng = np.random.default_rng(seed)
         if hasattr(self.action_space, "seed"):
-            self.action_space.seed(seed)
+            self.action_space.seed(None)
 
         self.current_step = 0
         self.accepted_mutation_count = 0
@@ -654,14 +707,14 @@ class MechanicalProteinEnv(_GymEnvBase):
             dtype=np.float32,
         )
         LOGGER.info(
-            "MechanicalProteinEnv ready residues=%s mutable_positions=%s action_dim=%s "
-            "observation_shape=%s max_steps=%s elapsed_sec=%.3f",
+            "Episode structure loaded pdb_path=%s residues=%s mutable_positions=%s "
+            "action_dim=%s observation_shape=%s elapsed_sec=%.3f",
+            self.initial_pdb_path,
             self.total_residues,
             self.n_mutable_positions,
             self.n_actions,
             initial_observation.shape,
-            self.max_steps,
-            time.perf_counter() - started,
+            time.perf_counter() - load_started,
         )
 
     # ------------------------------------------------------------------
@@ -820,18 +873,32 @@ class MechanicalProteinEnv(_GymEnvBase):
         self,
         *,
         seed: Optional[int] = None,
+        pdb_path: Optional[str] = None,
         options: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Reset to the wild-type structure and return (observation, info)."""
+        """Start a new episode and return (observation, info)."""
 
-        del options  # Reserved for future episode initialization variants.
+        options = {} if options is None else dict(options)
+        episode_pdb_path = pdb_path or options.get("pdb_path")
 
         if seed is not None:
             self._rng = np.random.default_rng(seed)
             if hasattr(self.action_space, "seed"):
                 self.action_space.seed(seed)
 
-        LOGGER.info("Environment reset started seed=%s", seed)
+        if episode_pdb_path is not None:
+            self._load_episode_structure(str(episode_pdb_path))
+            if seed is not None and hasattr(self.action_space, "seed"):
+                self.action_space.seed(seed)
+        elif self.reference_pose is None:
+            if self.initial_pdb_path is None:
+                raise ValueError(
+                    "No PDB structure is loaded. Pass initial_pdb_path to __init__ "
+                    "or pdb_path/options['pdb_path'] to reset()."
+                )
+            self._load_episode_structure(self.initial_pdb_path)
+
+        LOGGER.info("Environment reset started seed=%s pdb_path=%s", seed, self.initial_pdb_path)
         self.current_pose = self.backend.clone_pose(self.reference_pose)
         self.current_step = 0
         self.accepted_mutation_count = 0
@@ -842,8 +909,10 @@ class MechanicalProteinEnv(_GymEnvBase):
         observation = self._encode_observation()
         info = self._base_info()
         info["event"] = "reset"
+        info["pdb_path"] = self.initial_pdb_path
         LOGGER.info(
-            "Environment reset complete valid_actions=%s sequence=%s mutable_sequence=%s",
+            "Environment reset complete pdb_path=%s valid_actions=%s sequence=%s mutable_sequence=%s",
+            self.initial_pdb_path,
             info.get("valid_action_count"),
             info.get("sequence"),
             info.get("mutable_sequence"),

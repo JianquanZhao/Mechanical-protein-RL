@@ -24,15 +24,17 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from model.agent_module.ddqn_agent import DDQNAgent, DDQNConfig
+from model.dataset_module import ProteinStructureDataset
 from model.environment_module.environment import MechanicalProteinEnv
 from model.logging_module.training_logger import TrainingLogger, TrainingLoggerConfig
 from model.replay_buffer_module.replay_buffer import ReplayBuffer
 
 
-DEFAULT_PDB_PATH = "model/reward_module/wild_type.pdb"
+DEFAULT_PDB_DIR = "model/reward_module"
 DEFAULT_OUTPUT_DIR = "outputs/ddqn_base"
 LOGGER = logging.getLogger(__name__)
 
@@ -65,7 +67,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated GPU ids for multi mode, for example 0,1,2,3.",
     )
 
-    parser.add_argument("--initial-pdb", default=DEFAULT_PDB_PATH)
+    parser.add_argument("--pdb-dir", default=DEFAULT_PDB_DIR)
+    parser.add_argument("--train-index", default=None)
+    parser.add_argument("--val-index", default=None)
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--dataset-seed", type=int, default=7)
+    parser.add_argument("--recreate-splits", action="store_true")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--max-steps", type=int, default=5)
@@ -149,6 +156,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rolling-window", type=int, default=20)
     parser.add_argument("--enable-tensorboard", action="store_true")
     parser.add_argument("--no-resume-logs", action="store_true")
+    parser.add_argument("--validate-every", type=int, default=25)
+    parser.add_argument("--validation-episodes", type=int, default=5)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -219,9 +228,8 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         )
 
     LOGGER.info(
-        "Building MechanicalProteinEnv initial_pdb=%s max_steps=%s mutable_positions=%s "
+        "Building MechanicalProteinEnv max_steps=%s mutable_positions=%s "
         "repack=%s minimize=%s minimize_backbone=%s local_repack_radius=%s observation_encoder=%s",
-        args.initial_pdb,
         args.max_steps,
         args.mutable_positions or "all canonical residues",
         not args.no_repack,
@@ -231,7 +239,6 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         args.observation_encoder,
     )
     return MechanicalProteinEnv(
-        initial_pdb_path=args.initial_pdb,
         max_steps=args.max_steps,
         mutable_positions=parse_int_tuple(
             args.mutable_positions,
@@ -246,6 +253,17 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         observation_encoder=observation_encoder,
         pyrosetta_init_options=args.pyrosetta_options,
         seed=args.seed,
+    )
+
+
+def build_dataset(args: argparse.Namespace) -> ProteinStructureDataset:
+    return ProteinStructureDataset.from_folder(
+        args.pdb_dir,
+        train_index_path=args.train_index,
+        val_index_path=args.val_index,
+        val_fraction=args.val_fraction,
+        seed=args.dataset_seed,
+        recreate_indices=args.recreate_splits,
     )
 
 
@@ -360,6 +378,44 @@ def write_run_config(
     LOGGER.info("Wrote run configuration path=%s", output_dir / "run_config.json")
 
 
+def run_validation(
+    *,
+    agent: DDQNAgent,
+    env: MechanicalProteinEnv,
+    dataset: ProteinStructureDataset,
+    episode: int,
+    limit: int,
+) -> list[dict]:
+    records: list[dict] = []
+    for validation_index, pdb_path in enumerate(dataset.validation_paths(limit=limit)):
+        state, info = env.reset(pdb_path=str(pdb_path))
+        total_reward = 0.0
+        steps = 0
+        while True:
+            action = agent.select_action(
+                state,
+                action_mask=info["action_mask"],
+                evaluate=True,
+                advance_step=False,
+            )
+            state, reward, terminated, truncated, info = env.step(action)
+            total_reward += float(reward)
+            steps += 1
+            if terminated or truncated:
+                break
+        record = {
+            "episode": episode,
+            "validation_index": validation_index,
+            "pdb_path": str(pdb_path),
+            "total_reward": total_reward,
+            "steps": steps,
+            "sequence": info.get("sequence"),
+        }
+        records.append(record)
+        LOGGER.info("Validation episode complete record=%s", record)
+    return records
+
+
 def train(args: argparse.Namespace) -> None:
     if args.log_every_steps <= 0:
         raise ValueError("--log-every-steps must be a positive integer.")
@@ -379,10 +435,21 @@ def train(args: argparse.Namespace) -> None:
         for device_index in range(torch.cuda.device_count()):
             LOGGER.info("CUDA device %s: %s", device_index, torch.cuda.get_device_name(device_index))
 
+    dataset = build_dataset(args)
+    dataset_rng = np.random.default_rng(args.dataset_seed)
+    LOGGER.info(
+        "Dataset ready train_size=%s val_size=%s train_index=%s val_index=%s",
+        len(dataset.train_paths),
+        len(dataset.val_paths),
+        dataset.train_index_path,
+        dataset.val_index_path,
+    )
+
     device, gpu_ids = configure_training_mode(args)
     env = build_env(args)
-    LOGGER.info("Resetting environment with seed=%s", args.seed)
-    state, info = env.reset(seed=args.seed)
+    initial_pdb_path = dataset.train_paths[0]
+    LOGGER.info("Resetting environment with seed=%s initial_pdb=%s", args.seed, initial_pdb_path)
+    state, info = env.reset(seed=args.seed, pdb_path=str(initial_pdb_path))
     LOGGER.info(
         "Initial environment state ready state_shape=%s action_dim=%s valid_actions=%s sequence_len=%s",
         state.shape,
@@ -450,10 +517,12 @@ def train(args: argparse.Namespace) -> None:
         for episode in range(args.episodes):
             episode_started = time.perf_counter()
             LOGGER.info("Episode %s/%s starting", episode + 1, args.episodes)
-            state, info = env.reset()
+            episode_pdb_path = dataset.sample_train_path(dataset_rng)
+            state, info = env.reset(pdb_path=str(episode_pdb_path))
             LOGGER.info(
-                "Episode %s reset valid_actions=%s accepted_mutations=%s",
+                "Episode %s reset pdb_path=%s valid_actions=%s accepted_mutations=%s",
                 episode,
+                episode_pdb_path,
                 info.get("valid_action_count"),
                 info.get("accepted_mutation_count"),
             )
@@ -590,11 +659,37 @@ def train(args: argparse.Namespace) -> None:
                 info=info,
                 extra={
                     "candidate_pdb": None if candidate_path is None else str(candidate_path),
+                    "source_pdb": str(episode_pdb_path),
                     "mode": args.mode,
                     "device": str(agent.device),
                     "gpu_ids": list(gpu_ids),
                 },
             )
+
+            if (
+                args.validate_every > 0
+                and args.validation_episodes > 0
+                and dataset.val_paths
+                and (episode + 1) % args.validate_every == 0
+            ):
+                validation_records = run_validation(
+                    agent=agent,
+                    env=env,
+                    dataset=dataset,
+                    episode=episode,
+                    limit=args.validation_episodes,
+                )
+                validation_path = output_dir / "logs" / "validation.jsonl"
+                validation_path.parent.mkdir(parents=True, exist_ok=True)
+                with validation_path.open("a", encoding="utf-8") as file:
+                    for record in validation_records:
+                        file.write(json.dumps(record, sort_keys=True))
+                        file.write("\n")
+                LOGGER.info(
+                    "Validation records appended path=%s count=%s",
+                    validation_path,
+                    len(validation_records),
+                )
 
             if args.checkpoint_every > 0 and (episode + 1) % args.checkpoint_every == 0:
                 checkpoint_dir = output_dir / "checkpoints"
