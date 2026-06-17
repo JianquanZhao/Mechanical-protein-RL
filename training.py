@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         "--observation-encoder",
         choices=("default", "esm2"),
         default="default",
-        help="Use default one-hot environment observations or pooled ESM2 embeddings.",
+        help="Use default one-hot environment observations or per-residue ESM2 embeddings.",
     )
     parser.add_argument(
         "--esm2-device",
@@ -89,15 +89,19 @@ def parse_args() -> argparse.Namespace:
         help="Device for ESM2 observation encoding when --observation-encoder esm2.",
     )
     parser.add_argument(
-        "--esm2-pool",
-        choices=("mean", "cls"),
-        default="mean",
-        help="Pooling method for ESM2 token representations.",
-    )
-    parser.add_argument(
         "--esm2-mutable-only",
         action="store_true",
+        default=True,
         help="Encode only mutable positions with ESM2 instead of the full sequence.",
+    )
+    parser.add_argument(
+        "--esm2-full-sequence",
+        action="store_false",
+        dest="esm2_mutable_only",
+        help=(
+            "Encode the full sequence with ESM2. This requires the full sequence "
+            "length to match the environment action positions."
+        ),
     )
     parser.add_argument("--no-repack", action="store_true")
     parser.add_argument("--no-minimize", action="store_true")
@@ -203,16 +207,14 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         from model.encoding_module import ESM2SequenceEncoder
 
         LOGGER.info(
-            "Building ESM2 observation encoder embedding_dim=%s device=%s pool=%s mutable_only=%s",
+            "Building ESM2 observation encoder embedding_dim=%s device=%s output=per_residue mutable_only=%s",
             args.embedding_dim,
             args.esm2_device,
-            args.esm2_pool,
             args.esm2_mutable_only,
         )
         observation_encoder = ESM2SequenceEncoder(
             embedding_dim=args.embedding_dim,
             device=args.esm2_device,
-            pool=args.esm2_pool,
             mutable_only=args.esm2_mutable_only,
         )
 
@@ -404,12 +406,14 @@ def train(args: argparse.Namespace) -> None:
         action_dim=env.action_space.n,
         seed=args.seed,
         store_action_masks=True,
+        variable_length=args.observation_encoder == "esm2",
     )
     LOGGER.info(
-        "ReplayBuffer ready capacity=%s effective_batch_size=%s warmup=%s",
+        "ReplayBuffer ready capacity=%s effective_batch_size=%s warmup=%s variable_length=%s",
         args.replay_capacity,
         agent_config.effective_batch_size,
         agent_config.replay_warmup_size,
+        args.observation_encoder == "esm2",
     )
 
     logger = TrainingLogger(

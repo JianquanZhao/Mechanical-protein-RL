@@ -135,6 +135,64 @@ def test_q_network_accepts_protein_embedding_dimensions() -> None:
         assert network(torch.zeros(2, embedding_dim)).shape == (2, 3)
 
 
+def test_q_network_per_residue_output_shape() -> None:
+    network = QNetwork(
+        (4, 1280),
+        action_dim=80,
+        hidden_dims=(8,),
+        embedding_dim=1280,
+    )
+    assert network.per_residue_mode
+    assert network(torch.zeros(2, 4, 1280)).shape == (2, 80)
+    assert network(torch.zeros(4, 1280)).shape == (1, 80)
+
+
+def test_q_network_per_residue_requires_action_dim_matching_residues() -> None:
+    with pytest.raises(ValueError, match="residues \\* 20"):
+        QNetwork(
+            (4, 1280),
+            action_dim=79,
+            hidden_dims=(8,),
+            embedding_dim=1280,
+        )
+
+
+def test_ddqn_agent_optimizes_padded_per_residue_batch() -> None:
+    rng = np.random.default_rng(23)
+    states = rng.normal(size=(2, 3, 1280)).astype(np.float32)
+    next_states = rng.normal(size=(2, 3, 1280)).astype(np.float32)
+    states[0, 2, :] = 0.0
+    next_states[0, 2, :] = 0.0
+    next_action_masks = np.zeros((2, 60), dtype=bool)
+    next_action_masks[0, :40] = True
+    next_action_masks[1, :60] = True
+
+    batch = SimpleBatch(
+        states=states,
+        actions=np.asarray([5, 45], dtype=np.int64),
+        rewards=np.asarray([1.0, -0.5], dtype=np.float32),
+        next_states=next_states,
+        dones=np.asarray([False, False], dtype=bool),
+        next_action_masks=next_action_masks,
+    )
+    agent = DDQNAgent(
+        state_shape=(2, 1280),
+        action_dim=40,
+        config=make_config(
+            hidden_dims=(8,),
+            embedding_dim=1280,
+            micro_batch_size=1,
+            gradient_accumulation_steps=2,
+        ),
+    )
+
+    result = agent.optimize_batch(batch)
+
+    assert result.effective_batch_size == 2
+    assert result.micro_batches == 2
+    assert agent.optimization_steps == 1
+
+
 def test_q_network_projects_legacy_observation_to_embedding_space() -> None:
     network = QNetwork((6,), action_dim=5, hidden_dims=(8,), embedding_dim=1280)
     assert isinstance(network.input_projection, nn.Linear)

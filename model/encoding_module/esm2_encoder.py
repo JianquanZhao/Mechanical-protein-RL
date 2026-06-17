@@ -26,7 +26,7 @@ ESM2_MODEL_SPECS: Dict[int, Tuple[str, int]] = {
 
 class ESM2SequenceEncoder:
     """
-    Encode the current protein sequence into a fixed-size ESM2 embedding.
+    Encode the current protein sequence into per-residue ESM2 embeddings.
 
     Parameters
     ----------
@@ -35,13 +35,10 @@ class ESM2SequenceEncoder:
         5120, matching common ESM2 checkpoints.
     device:
         Torch device for the ESM2 model. "auto" selects CUDA when available.
-    pool:
-        "mean" averages residue token embeddings, excluding BOS/EOS tokens.
-        "cls" returns the BOS token representation.
     mutable_only:
-        If true, encode only env.current_sequence(mutable_only=True). The
-        default encodes the complete sequence so the embedding keeps global
-        protein context.
+        If true, encode env.current_sequence(mutable_only=True). This is the
+        default because the DDQN action layout is aligned to mutable positions:
+        one residue row corresponds to 20 amino-acid actions.
     """
 
     def __init__(
@@ -49,17 +46,13 @@ class ESM2SequenceEncoder:
         *,
         embedding_dim: int = 1280,
         device: str = "auto",
-        pool: str = "mean",
-        mutable_only: bool = False,
+        mutable_only: bool = True,
     ) -> None:
         if int(embedding_dim) not in ESM2_MODEL_SPECS:
             raise ValueError(
                 "embedding_dim must be one of "
                 f"{tuple(ESM2_MODEL_SPECS)}."
             )
-        if pool not in {"mean", "cls"}:
-            raise ValueError("pool must be 'mean' or 'cls'.")
-
         try:
             import esm
         except ImportError as exc:  # pragma: no cover - depends on optional package.
@@ -89,9 +82,12 @@ class ESM2SequenceEncoder:
         self.embedding_dim = int(embedding_dim)
         self.representation_layer = int(representation_layer)
         self.device = torch.device(device)
-        self.pool = pool
         self.mutable_only = bool(mutable_only)
-        LOGGER.info("ESM2 encoder ready model=%s device=%s pool=%s", model_name, self.device, self.pool)
+        LOGGER.info(
+            "ESM2 encoder ready model=%s device=%s output=per_residue",
+            model_name,
+            self.device,
+        )
 
     def __call__(self, pose: Any, env: Any) -> np.ndarray:
         del pose
@@ -103,25 +99,22 @@ class ESM2SequenceEncoder:
         tokens = tokens.to(self.device)
 
         LOGGER.info(
-            "Encoding sequence with ESM2 length=%s embedding_dim=%s device=%s pool=%s",
+            "Encoding sequence with ESM2 length=%s embedding_dim=%s device=%s output=per_residue",
             len(sequence),
             self.embedding_dim,
             self.device,
-            self.pool,
         )
         with torch.no_grad():
             outputs = self.model(tokens, repr_layers=[self.representation_layer])
             representations = outputs["representations"][self.representation_layer]
 
-        if self.pool == "cls":
-            embedding = representations[0, 0]
-        else:
-            # Token layout is BOS, residues..., EOS. Average only residue tokens.
-            embedding = representations[0, 1 : len(sequence) + 1].mean(dim=0)
+        # Token layout is BOS, residues..., EOS. Return only residue tokens.
+        embedding = representations[0, 1 : len(sequence) + 1]
 
         array = embedding.detach().cpu().numpy().astype(np.float32, copy=False)
-        if array.shape != (self.embedding_dim,):
+        if array.shape != (len(sequence), self.embedding_dim):
             raise RuntimeError(
-                f"ESM2 embedding has shape {array.shape}, expected {(self.embedding_dim,)}."
+                "ESM2 per-residue embedding has shape "
+                f"{array.shape}, expected {(len(sequence), self.embedding_dim)}."
             )
         return array

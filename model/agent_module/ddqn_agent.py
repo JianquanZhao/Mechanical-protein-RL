@@ -39,6 +39,7 @@ from torch.nn import functional as F
 PathLike = Union[str, Path]
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_PROTEIN_EMBEDDING_DIMS = (1280, 2560, 5120)
+AMINO_ACID_ACTION_DIM = 20
 
 
 @dataclass(frozen=True)
@@ -131,10 +132,12 @@ class QNetwork(nn.Module):
     """
     Q head for protein-language-model encoded observations.
 
-    The preferred input is a fixed-size pooled protein embedding with trailing
-    dimension ``embedding_dim``. For compatibility with legacy one-hot
-    observations, any fixed ``state_shape`` is first projected into the selected
-    protein embedding space, then mapped to action Q values by the MLP head.
+    Preferred ESM2 input shape is ``(L, embedding_dim)``. In that mode the
+    network applies the same residue-wise head to every residue and returns a
+    flattened ``(batch, L * 20)`` tensor, matching the environment action layout.
+
+    Legacy pooled or one-hot observations are still supported through the
+    original flatten -> projection -> MLP path.
     """
 
     def __init__(
@@ -153,6 +156,32 @@ class QNetwork(nn.Module):
         hidden_dims = tuple(int(value) for value in hidden_dims)
         if not hidden_dims or any(value <= 0 for value in hidden_dims):
             raise ValueError("hidden_dims must contain positive integers.")
+
+        is_per_residue_shape = _is_per_residue_state_shape(
+            self.state_shape,
+            self.embedding_dim,
+        )
+        if (
+            is_per_residue_shape
+            and self.action_dim != self.state_shape[0] * AMINO_ACID_ACTION_DIM
+        ):
+            raise ValueError(
+                "Per-residue QNetwork states require action_dim == residues * 20; "
+                f"got action_dim={self.action_dim}, residues={self.state_shape[0]}."
+            )
+        self.per_residue_mode = is_per_residue_shape
+
+        if self.per_residue_mode:
+            dimensions = (self.embedding_dim, *hidden_dims, AMINO_ACID_ACTION_DIM)
+            layers = []
+            for input_dim, output_dim in zip(dimensions[:-2], dimensions[1:-1]):
+                layers.append(nn.Linear(input_dim, output_dim))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(dimensions[-2], dimensions[-1]))
+            self.residue_head = nn.Sequential(*layers)
+            self.input_projection = nn.Identity()
+            self.network = nn.Identity()
+            return
 
         flattened_dim = int(np.prod(self.state_shape))
         if flattened_dim == self.embedding_dim:
@@ -173,6 +202,24 @@ class QNetwork(nn.Module):
     def forward(self, states: Tensor) -> Tensor:
         if states.ndim == len(self.state_shape):
             states = states.unsqueeze(0)
+
+        if self.per_residue_mode:
+            if states.ndim != 3:
+                raise ValueError(
+                    "Per-residue states must have shape (batch, residues, "
+                    f"{self.embedding_dim}), got {tuple(states.shape)}."
+                )
+            if states.shape[-1] != self.embedding_dim:
+                raise ValueError(
+                    f"Expected per-residue embedding dimension {self.embedding_dim}, "
+                    f"got {states.shape[-1]}."
+                )
+            batch_size, residue_count, _ = states.shape
+            residue_q_values = self.residue_head(states)
+            return residue_q_values.reshape(
+                batch_size,
+                residue_count * AMINO_ACID_ACTION_DIM,
+            )
 
         expected_ndim = len(self.state_shape) + 1
         if states.ndim != expected_ndim:
@@ -230,6 +277,15 @@ class DDQNAgent:
         self.state_shape = _validate_state_shape(state_shape)
         self.action_dim = _validate_positive_int(action_dim, "action_dim")
         self.config = config
+        self.per_residue_mode = _is_per_residue_state_shape(
+            self.state_shape,
+            config.embedding_dim,
+        )
+        if self.per_residue_mode and self.action_dim != self.state_shape[0] * AMINO_ACID_ACTION_DIM:
+            raise ValueError(
+                "Per-residue DDQN states require action_dim == residues * 20; "
+                f"got action_dim={self.action_dim}, residues={self.state_shape[0]}."
+            )
         self.device = self._resolve_device(config.device)
         LOGGER.info("DDQNAgent resolved device=%s", self.device)
         self._rng = np.random.default_rng(config.seed)
@@ -305,7 +361,11 @@ class DDQNAgent:
         """
 
         state_array = self._coerce_single_state(state)
-        mask_array = self._coerce_single_mask(action_mask)
+        current_action_dim = self._action_dim_for_state_array(state_array)
+        mask_array = self._coerce_single_mask(
+            action_mask,
+            action_dim=current_action_dim,
+        )
         valid_actions = np.flatnonzero(mask_array)
 
         if valid_actions.size == 0:
@@ -758,26 +818,34 @@ class DDQNAgent:
         next_states = np.asarray(batch.next_states, dtype=np.float32)
         dones = np.asarray(batch.dones, dtype=np.bool_)
 
-        if states.ndim != len(self.state_shape) + 1:
-            raise ValueError("Batch states have an invalid number of dimensions.")
-        if tuple(states.shape[1:]) != self.state_shape:
-            raise ValueError(
-                f"Batch states must have trailing shape {self.state_shape}, "
-                f"got {tuple(states.shape[1:])}."
-            )
+        if self.per_residue_mode:
+            if states.ndim != 3 or states.shape[-1] != self.config.embedding_dim:
+                raise ValueError(
+                    "Per-residue batch states must have shape "
+                    f"(batch, residues, {self.config.embedding_dim}), got {states.shape}."
+                )
+        else:
+            if states.ndim != len(self.state_shape) + 1:
+                raise ValueError("Batch states have an invalid number of dimensions.")
+            if tuple(states.shape[1:]) != self.state_shape:
+                raise ValueError(
+                    f"Batch states must have trailing shape {self.state_shape}, "
+                    f"got {tuple(states.shape[1:])}."
+                )
 
         batch_size = int(states.shape[0])
         if batch_size <= 0:
             raise ValueError("Replay batch must contain at least one transition.")
         if next_states.shape != states.shape:
             raise ValueError("next_states must have the same shape as states.")
+        batch_action_dim = self._action_dim_for_state_batch(states)
         if actions.shape != (batch_size,):
             raise ValueError("actions must have shape (batch_size,).")
         if rewards.shape != (batch_size,):
             raise ValueError("rewards must have shape (batch_size,).")
         if dones.shape != (batch_size,):
             raise ValueError("dones must have shape (batch_size,).")
-        if np.any(actions < 0) or np.any(actions >= self.action_dim):
+        if np.any(actions < 0) or np.any(actions >= batch_action_dim):
             raise ValueError("Replay batch contains an out-of-range action.")
         if not np.all(np.isfinite(states)):
             raise ValueError("states contain NaN or infinity.")
@@ -792,10 +860,10 @@ class DDQNAgent:
             next_action_masks = None
         else:
             next_action_masks = np.asarray(next_action_masks_value, dtype=np.bool_)
-            if next_action_masks.shape != (batch_size, self.action_dim):
+            if next_action_masks.shape != (batch_size, batch_action_dim):
                 raise ValueError(
                     "next_action_masks must have shape "
-                    f"{(batch_size, self.action_dim)}."
+                    f"{(batch_size, batch_action_dim)}."
                 )
 
         return {
@@ -809,7 +877,13 @@ class DDQNAgent:
 
     def _coerce_single_state(self, state: Any) -> np.ndarray:
         array = np.asarray(state, dtype=np.float32)
-        if array.shape != self.state_shape:
+        if self.per_residue_mode:
+            if array.ndim != 2 or array.shape[-1] != self.config.embedding_dim:
+                raise ValueError(
+                    "per-residue state must have shape "
+                    f"(residues, {self.config.embedding_dim}), got {array.shape}."
+                )
+        elif array.shape != self.state_shape:
             raise ValueError(
                 f"state must have shape {self.state_shape}, got {array.shape}."
             )
@@ -817,16 +891,37 @@ class DDQNAgent:
             raise ValueError("state contains NaN or infinity.")
         return array
 
-    def _coerce_single_mask(self, action_mask: Optional[Any]) -> np.ndarray:
+    def _coerce_single_mask(
+        self,
+        action_mask: Optional[Any],
+        *,
+        action_dim: Optional[int] = None,
+    ) -> np.ndarray:
+        expected_action_dim = self.action_dim if action_dim is None else int(action_dim)
         if action_mask is None:
-            return np.ones(self.action_dim, dtype=np.bool_)
+            return np.ones(expected_action_dim, dtype=np.bool_)
         array = np.asarray(action_mask, dtype=np.bool_)
-        if array.shape != (self.action_dim,):
+        if array.shape != (expected_action_dim,):
             raise ValueError(
-                f"action_mask must have shape {(self.action_dim,)}, "
+                f"action_mask must have shape {(expected_action_dim,)}, "
                 f"got {array.shape}."
             )
         return array
+
+    def _action_dim_for_state_array(self, state: np.ndarray) -> int:
+        if self.per_residue_mode:
+            return int(state.shape[0]) * AMINO_ACID_ACTION_DIM
+        return self.action_dim
+
+    def _action_dim_for_state_batch(self, states: np.ndarray) -> int:
+        if self.per_residue_mode:
+            if states.ndim != 3 or states.shape[-1] != self.config.embedding_dim:
+                raise ValueError(
+                    "Per-residue batch states must have shape "
+                    f"(batch, residues, {self.config.embedding_dim}), got {states.shape}."
+                )
+            return int(states.shape[1]) * AMINO_ACID_ACTION_DIM
+        return self.action_dim
 
     def _tensor(self, array: np.ndarray, dtype: torch.dtype) -> Tensor:
         return torch.as_tensor(array, dtype=dtype, device=self.device)
@@ -907,6 +1002,14 @@ def _validate_embedding_dim(value: Any) -> int:
             f"{SUPPORTED_PROTEIN_EMBEDDING_DIMS}."
         )
     return embedding_dim
+
+
+def _is_per_residue_state_shape(
+    state_shape: Sequence[int],
+    embedding_dim: int,
+) -> bool:
+    shape = tuple(int(value) for value in state_shape)
+    return len(shape) == 2 and shape[-1] == int(embedding_dim)
 
 
 def _torch_load(

@@ -83,6 +83,7 @@ class ReplayBuffer:
         state_dtype: Union[str, np.dtype, type] = np.float32,
         reward_dtype: Union[str, np.dtype, type] = np.float32,
         store_action_masks: bool = True,
+        variable_length: bool = False,
     ) -> None:
         self.capacity = self._validate_positive_int(capacity, "capacity")
         self.state_shape = self._validate_state_shape(state_shape)
@@ -90,22 +91,28 @@ class ReplayBuffer:
         self.state_dtype = np.dtype(state_dtype)
         self.reward_dtype = np.dtype(reward_dtype)
         self.store_action_masks = bool(store_action_masks)
+        self.variable_length = bool(variable_length)
 
         self._rng = np.random.default_rng(seed)
         self._position = 0
         self._size = 0
         LOGGER.info(
             "ReplayBuffer initialized capacity=%s state_shape=%s action_dim=%s "
-            "store_action_masks=%s seed=%s",
+            "store_action_masks=%s variable_length=%s seed=%s",
             self.capacity,
             self.state_shape,
             self.action_dim,
             self.store_action_masks,
+            self.variable_length,
             seed,
         )
 
-        self._states = np.empty((self.capacity, *self.state_shape), dtype=self.state_dtype)
-        self._next_states = np.empty((self.capacity, *self.state_shape), dtype=self.state_dtype)
+        if self.variable_length:
+            self._states = np.empty(self.capacity, dtype=object)
+            self._next_states = np.empty(self.capacity, dtype=object)
+        else:
+            self._states = np.empty((self.capacity, *self.state_shape), dtype=self.state_dtype)
+            self._next_states = np.empty((self.capacity, *self.state_shape), dtype=self.state_dtype)
         self._actions = np.empty(self.capacity, dtype=np.int64)
         self._rewards = np.empty(self.capacity, dtype=self.reward_dtype)
         self._terminateds = np.empty(self.capacity, dtype=np.bool_)
@@ -113,12 +120,16 @@ class ReplayBuffer:
         self._dones = np.empty(self.capacity, dtype=np.bool_)
 
         if self.store_action_masks:
-            self._action_masks: Optional[np.ndarray] = np.empty(
-                (self.capacity, self.action_dim), dtype=np.bool_
-            )
-            self._next_action_masks: Optional[np.ndarray] = np.empty(
-                (self.capacity, self.action_dim), dtype=np.bool_
-            )
+            if self.variable_length:
+                self._action_masks = np.empty(self.capacity, dtype=object)
+                self._next_action_masks = np.empty(self.capacity, dtype=object)
+            else:
+                self._action_masks: Optional[np.ndarray] = np.empty(
+                    (self.capacity, self.action_dim), dtype=np.bool_
+                )
+                self._next_action_masks: Optional[np.ndarray] = np.empty(
+                    (self.capacity, self.action_dim), dtype=np.bool_
+                )
         else:
             self._action_masks = None
             self._next_action_masks = None
@@ -155,7 +166,12 @@ class ReplayBuffer:
 
         state_array = self._coerce_state(state, "state")
         next_state_array = self._coerce_state(next_state, "next_state")
-        action_value = self._validate_action(action)
+        action_dim = (
+            self._action_dim_for_state(state_array)
+            if self.variable_length
+            else self.action_dim
+        )
+        action_value = self._validate_action(action, action_dim=action_dim)
         reward_value = self._validate_finite_scalar(reward, "reward")
 
         terminated_value = bool(terminated)
@@ -173,8 +189,18 @@ class ReplayBuffer:
                 )
 
         if self.store_action_masks:
-            current_mask = self._coerce_mask(action_mask, "action_mask")
-            next_mask = self._coerce_mask(next_action_mask, "next_action_mask")
+            current_mask = self._coerce_mask(
+                action_mask,
+                "action_mask",
+                expected_dim=action_dim,
+            )
+            next_mask = self._coerce_mask(
+                next_action_mask,
+                "next_action_mask",
+                expected_dim=self._action_dim_for_state(next_state_array)
+                if self.variable_length
+                else self.action_dim,
+            )
         else:
             if action_mask is not None or next_action_mask is not None:
                 raise ValueError("Mask values were supplied, but store_action_masks=False.")
@@ -232,18 +258,39 @@ class ReplayBuffer:
             indices[: min(10, len(indices))].tolist(),
         )
 
+        if self.variable_length:
+            states = self._pad_state_batch([self._states[index] for index in indices])
+            next_states = self._pad_state_batch([self._next_states[index] for index in indices])
+            action_masks = (
+                None
+                if self._action_masks is None
+                else self._pad_mask_batch([self._action_masks[index] for index in indices])
+            )
+            next_action_masks = (
+                None
+                if self._next_action_masks is None
+                else self._pad_mask_batch([self._next_action_masks[index] for index in indices])
+            )
+        else:
+            states = self._states[indices].copy()
+            next_states = self._next_states[indices].copy()
+            action_masks = None if self._action_masks is None else self._action_masks[indices].copy()
+            next_action_masks = (
+                None
+                if self._next_action_masks is None
+                else self._next_action_masks[indices].copy()
+            )
+
         return ReplayBatch(
-            states=self._states[indices].copy(),
+            states=states,
             actions=self._actions[indices].copy(),
             rewards=self._rewards[indices].copy(),
-            next_states=self._next_states[indices].copy(),
+            next_states=next_states,
             terminateds=self._terminateds[indices].copy(),
             truncateds=self._truncateds[indices].copy(),
             dones=self._dones[indices].copy(),
-            action_masks=None if self._action_masks is None else self._action_masks[indices].copy(),
-            next_action_masks=None
-            if self._next_action_masks is None
-            else self._next_action_masks[indices].copy(),
+            action_masks=action_masks,
+            next_action_masks=next_action_masks,
             indices=indices.copy(),
         )
 
@@ -265,6 +312,7 @@ class ReplayBuffer:
             "state_dtype": self.state_dtype.str,
             "reward_dtype": self.reward_dtype.str,
             "store_action_masks": self.store_action_masks,
+            "variable_length": self.variable_length,
             "position": self._position,
             "size": size,
             "states": self._states[:size].copy(),
@@ -295,22 +343,32 @@ class ReplayBuffer:
         if not 0 <= position < self.capacity:
             raise ValueError(f"Snapshot position must be within 0..{self.capacity - 1}.")
 
-        self._states[:size] = self._snapshot_array(payload["states"], (size, *self.state_shape), self.state_dtype, "states")
+        if self.variable_length:
+            self._states[:size] = self._snapshot_object_array(payload["states"], size, "states")
+        else:
+            self._states[:size] = self._snapshot_array(payload["states"], (size, *self.state_shape), self.state_dtype, "states")
         self._actions[:size] = self._snapshot_array(payload["actions"], (size,), np.dtype(np.int64), "actions")
         self._rewards[:size] = self._snapshot_array(payload["rewards"], (size,), self.reward_dtype, "rewards")
-        self._next_states[:size] = self._snapshot_array(payload["next_states"], (size, *self.state_shape), self.state_dtype, "next_states")
+        if self.variable_length:
+            self._next_states[:size] = self._snapshot_object_array(payload["next_states"], size, "next_states")
+        else:
+            self._next_states[:size] = self._snapshot_array(payload["next_states"], (size, *self.state_shape), self.state_dtype, "next_states")
         self._terminateds[:size] = self._snapshot_array(payload["terminateds"], (size,), np.dtype(np.bool_), "terminateds")
         self._truncateds[:size] = self._snapshot_array(payload["truncateds"], (size,), np.dtype(np.bool_), "truncateds")
         self._dones[:size] = self._snapshot_array(payload["dones"], (size,), np.dtype(np.bool_), "dones")
 
         if self.store_action_masks:
             assert self._action_masks is not None and self._next_action_masks is not None
-            self._action_masks[:size] = self._snapshot_array(
-                payload["action_masks"], (size, self.action_dim), np.dtype(np.bool_), "action_masks"
-            )
-            self._next_action_masks[:size] = self._snapshot_array(
-                payload["next_action_masks"], (size, self.action_dim), np.dtype(np.bool_), "next_action_masks"
-            )
+            if self.variable_length:
+                self._action_masks[:size] = self._snapshot_object_array(payload["action_masks"], size, "action_masks")
+                self._next_action_masks[:size] = self._snapshot_object_array(payload["next_action_masks"], size, "next_action_masks")
+            else:
+                self._action_masks[:size] = self._snapshot_array(
+                    payload["action_masks"], (size, self.action_dim), np.dtype(np.bool_), "action_masks"
+                )
+                self._next_action_masks[:size] = self._snapshot_array(
+                    payload["next_action_masks"], (size, self.action_dim), np.dtype(np.bool_), "next_action_masks"
+                )
 
         self._position = position
         self._size = size
@@ -328,7 +386,7 @@ class ReplayBuffer:
             for key in (
                 "format_version", "capacity", "state_shape", "action_dim",
                 "state_dtype", "reward_dtype", "store_action_masks",
-                "position", "size", "rng_state"
+                "variable_length", "position", "size", "rng_state"
             )
         }
         np.savez_compressed(
@@ -366,6 +424,7 @@ class ReplayBuffer:
                 state_dtype=np.dtype(metadata["state_dtype"]),
                 reward_dtype=np.dtype(metadata["reward_dtype"]),
                 store_action_masks=bool(metadata["store_action_masks"]),
+                variable_length=bool(metadata.get("variable_length", False)),
             )
             payload = dict(metadata)
             payload.update(
@@ -399,12 +458,13 @@ class ReplayBuffer:
             raise ValueError("state_shape must contain positive dimensions.")
         return shape
 
-    def _validate_action(self, action: Any) -> int:
+    def _validate_action(self, action: Any, *, action_dim: Optional[int] = None) -> int:
         if isinstance(action, bool) or not isinstance(action, (int, np.integer)):
             raise TypeError("action must be an integer.")
         action = int(action)
-        if not 0 <= action < self.action_dim:
-            raise ValueError(f"action must be within 0..{self.action_dim - 1}.")
+        upper = self.action_dim if action_dim is None else int(action_dim)
+        if not 0 <= action < upper:
+            raise ValueError(f"action must be within 0..{upper - 1}.")
         return action
 
     @staticmethod
@@ -416,19 +476,64 @@ class ReplayBuffer:
 
     def _coerce_state(self, state: Any, name: str) -> np.ndarray:
         array = np.asarray(state, dtype=self.state_dtype)
-        if array.shape != self.state_shape:
+        if self.variable_length:
+            if array.ndim != len(self.state_shape):
+                raise ValueError(
+                    f"{name} must have {len(self.state_shape)} dimensions, got {array.shape}."
+                )
+            if tuple(array.shape[1:]) != self.state_shape[1:]:
+                raise ValueError(
+                    f"{name} must have trailing shape {self.state_shape[1:]}, got {array.shape[1:]}."
+                )
+        elif array.shape != self.state_shape:
             raise ValueError(f"{name} must have shape {self.state_shape}, got {array.shape}.")
         if not np.all(np.isfinite(array)):
             raise ValueError(f"{name} contains NaN or infinity.")
         return array
 
-    def _coerce_mask(self, mask: Optional[Any], name: str) -> np.ndarray:
+    def _coerce_mask(
+        self,
+        mask: Optional[Any],
+        name: str,
+        *,
+        expected_dim: Optional[int] = None,
+    ) -> np.ndarray:
+        expected = self.action_dim if expected_dim is None else int(expected_dim)
         if mask is None:
-            return np.ones(self.action_dim, dtype=np.bool_)
+            return np.ones(expected, dtype=np.bool_)
         array = np.asarray(mask, dtype=np.bool_)
-        if array.shape != (self.action_dim,):
+        if self.variable_length:
+            if array.shape != (expected,):
+                raise ValueError(f"{name} must have shape {(expected,)}, got {array.shape}.")
+        elif array.shape != (self.action_dim,):
             raise ValueError(f"{name} must have shape {(self.action_dim,)}, got {array.shape}.")
         return array
+
+    @staticmethod
+    def _action_dim_for_state(state: np.ndarray) -> int:
+        if state.ndim == 2:
+            return int(state.shape[0]) * 20
+        return int(np.prod(state.shape))
+
+    def _pad_state_batch(self, states: Sequence[np.ndarray]) -> np.ndarray:
+        if not states:
+            raise ValueError("Cannot pad an empty state batch.")
+        max_length = max(int(state.shape[0]) for state in states)
+        trailing_shape = states[0].shape[1:]
+        padded = np.zeros((len(states), max_length, *trailing_shape), dtype=self.state_dtype)
+        for row, state in enumerate(states):
+            padded[row, : state.shape[0], ...] = state
+        return padded
+
+    @staticmethod
+    def _pad_mask_batch(masks: Sequence[np.ndarray]) -> np.ndarray:
+        if not masks:
+            raise ValueError("Cannot pad an empty mask batch.")
+        max_length = max(int(mask.shape[0]) for mask in masks)
+        padded = np.zeros((len(masks), max_length), dtype=np.bool_)
+        for row, mask in enumerate(masks):
+            padded[row, : mask.shape[0]] = mask
+        return padded
 
     def _assert_compatible_snapshot(self, payload: Mapping[str, Any]) -> None:
         expected = (
@@ -438,6 +543,7 @@ class ReplayBuffer:
             self.state_dtype.str,
             self.reward_dtype.str,
             self.store_action_masks,
+            self.variable_length,
         )
         actual = (
             int(payload["capacity"]),
@@ -446,6 +552,7 @@ class ReplayBuffer:
             np.dtype(payload["state_dtype"]).str,
             np.dtype(payload["reward_dtype"]).str,
             bool(payload["store_action_masks"]),
+            bool(payload.get("variable_length", False)),
         )
         if actual != expected:
             raise ValueError("Snapshot configuration is incompatible with this buffer.")
@@ -455,6 +562,13 @@ class ReplayBuffer:
         array = np.asarray(value, dtype=dtype)
         if array.shape != shape:
             raise ValueError(f"Snapshot array '{name}' must have shape {shape}, got {array.shape}.")
+        return array
+
+    @staticmethod
+    def _snapshot_object_array(value: Any, size: int, name: str) -> np.ndarray:
+        array = np.asarray(value, dtype=object)
+        if array.shape != (size,):
+            raise ValueError(f"Snapshot object array '{name}' must have shape {(size,)}, got {array.shape}.")
         return array
 
 
