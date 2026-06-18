@@ -312,3 +312,124 @@ python training.py \
 - 默认 one-hot observation 仍要求固定长度；多长度训练建议使用 ESM2 per-residue observation。
 - 如果显式传入固定 `mutable_positions`，不同 PDB 必须都包含这些 pose positions；否则 reset 会报错。
 - validation 当前只运行 greedy rollout 并记录 JSONL，还没有独立 checkpoint selection / early stopping。
+
+# 2026-06-18 蛋白结构数据预处理
+
+## 背景
+
+用户的数据文件夹中可能同时包含蛋白质、DNA/RNA 或其他生物分子结构文件。训练入口虽然使用 `--pdb-dir` 指向整个结构文件夹，但 DDQN 环境当前只支持 canonical amino-acid mutation，因此 dataset 初始化阶段必须先过滤掉非蛋白结构，避免 DNA 文件进入 train/val split 后在 PyRosetta 环境 reset 或 action 解码阶段失败。
+
+## 修改内容
+
+修改：
+
+```text
+model/dataset_module/dataset.py
+```
+
+新增预处理函数：
+
+- `count_canonical_protein_residues(path)`：读取 PDB `ATOM` 记录，统计唯一 canonical protein residues。
+- `is_protein_structure_file(path, min_protein_residues=1)`：判断结构文件是否至少包含指定数量的 canonical protein residues。
+- `filter_protein_structure_files(files, min_protein_residues=1, require_non_empty=True)`：批量过滤结构文件，并输出过滤日志。
+
+当前支持的 canonical protein residue names：
+
+```text
+ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL
+```
+
+`ProteinStructureDataset.from_folder(...)` 现在会在初始化时完成预处理：
+
+- 新建 train/val index 时：先递归发现 `.pdb/.ent` 文件，再过滤合法蛋白结构，最后划分 train/val。
+- 读取已有 train/val index 时：仍会重新检查 index 中的文件；如果发现 DNA/非蛋白文件，会从 index 中移除并重写 index。
+- 训练集最终不能为空；验证集允许为空。
+
+修改：
+
+```text
+model/dataset_module/__init__.py
+```
+
+导出新增的 dataset 预处理函数，方便后续脚本或测试复用。
+
+修改：
+
+```text
+training.py
+```
+
+新增命令行参数：
+
+```bash
+--min-protein-residues
+```
+
+默认值为 `1`，表示结构文件中至少包含 1 个 canonical protein residue 才能进入 train/val 候选。该参数会传入 `ProteinStructureDataset.from_folder(...)`，并在 dataset ready 日志中输出。
+
+## 测试更新
+
+修改：
+
+```text
+tests/test_dataset.py
+```
+
+新增覆盖：
+
+- canonical protein residue 计数；
+- DNA-only PDB 被过滤；
+- mixed DNA/protein PDB 只要包含 canonical protein residue 就可作为蛋白候选；
+- dataset split 不会把 DNA-only 文件写入 train/val index；
+- 已存在 index 中的 DNA-only 文件会被过滤并触发 index 重写。
+
+## 验证结果
+
+编译检查：
+
+```bash
+python -m py_compile \
+  training.py \
+  model/dataset_module/__init__.py \
+  model/dataset_module/dataset.py \
+  tests/test_dataset.py
+```
+
+dataset 测试：
+
+```text
+5 passed in 0.18s
+```
+
+全量测试：
+
+```text
+86 passed, 1 skipped in 5.15s
+```
+
+`mprl-vgpt` 环境下文件夹训练冒烟测试：
+
+```bash
+conda run -n mprl-vgpt python training.py \
+  --pdb-dir model/reward_module \
+  --mode single \
+  --device cpu \
+  --episodes 1 \
+  --max-steps 1 \
+  --output-dir /tmp/mprl-protein-filter-smoke \
+  --replay-warmup-size 1 \
+  --micro-batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --checkpoint-every 1 \
+  --no-resume-logs \
+  --validate-every 0 \
+  --log-level WARNING
+```
+
+结果：成功完成。
+
+## 当前边界
+
+- 预处理基于 PDB 文本中的 `ATOM` records 和 canonical residue names，不会启动 PyRosetta。
+- DNA/RNA-only 结构会被过滤；蛋白-DNA 复合物只要包含 canonical protein residue，仍会被视为合法蛋白结构候选。
+- 只含非标准氨基酸或修饰残基、且没有 canonical residue name 的结构会被过滤；如果后续需要支持 MSE 等修饰残基，可以扩展 residue allowlist 或增加 PyRosetta 级别的结构检查。

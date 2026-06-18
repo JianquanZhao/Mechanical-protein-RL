@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--dataset-seed", type=int, default=7)
     parser.add_argument("--recreate-splits", action="store_true")
+    parser.add_argument(
+        "--min-protein-residues",
+        type=int,
+        default=1,
+        help="Minimum canonical protein residues required for a structure file to enter train/val splits.",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--max-steps", type=int, default=5)
@@ -264,6 +270,7 @@ def build_dataset(args: argparse.Namespace) -> ProteinStructureDataset:
         val_fraction=args.val_fraction,
         seed=args.dataset_seed,
         recreate_indices=args.recreate_splits,
+        min_protein_residues=args.min_protein_residues,
     )
 
 
@@ -438,11 +445,12 @@ def train(args: argparse.Namespace) -> None:
     dataset = build_dataset(args)
     dataset_rng = np.random.default_rng(args.dataset_seed)
     LOGGER.info(
-        "Dataset ready train_size=%s val_size=%s train_index=%s val_index=%s",
+        "Dataset ready train_size=%s val_size=%s train_index=%s val_index=%s min_protein_residues=%s",
         len(dataset.train_paths),
         len(dataset.val_paths),
         dataset.train_index_path,
         dataset.val_index_path,
+        dataset.min_protein_residues,
     )
 
     device, gpu_ids = configure_training_mode(args)
