@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import numpy as np
+
 from model.dataset_module.dataset import (
     ProteinStructureDataset,
+    backbone_missing_fraction,
     count_canonical_protein_residues,
     discover_structure_files,
     filter_protein_structure_files,
@@ -9,15 +12,21 @@ from model.dataset_module.dataset import (
 )
 
 
-def write_pdb(path: Path, residues: list[tuple[str, int]]) -> None:
+def write_pdb(
+    path: Path,
+    residues: list[tuple[str, int]],
+    *,
+    atoms: tuple[str, ...] = ("N", "CA", "C", "O"),
+) -> None:
     lines = []
     atom_index = 1
     for residue_name, residue_number in residues:
-        lines.append(
-            f"ATOM  {atom_index:5d}  CA  {residue_name:>3s} A{residue_number:4d}"
-            "      11.104  13.207   9.447  1.00 20.00           C\n"
-        )
-        atom_index += 1
+        for atom_name in atoms:
+            lines.append(
+                f"ATOM  {atom_index:5d} {atom_name:>4s} {residue_name:>3s} A{residue_number:4d}"
+                "      11.104  13.207   9.447  1.00 20.00           C\n"
+            )
+            atom_index += 1
     lines.append("END\n")
     path.write_text("".join(lines), encoding="utf-8")
 
@@ -55,6 +64,52 @@ def test_dataset_split_writes_and_reads_indices(tmp_path: Path) -> None:
     assert restored.val_paths == dataset.val_paths
 
 
+def test_dataset_iter_train_batches_covers_epoch_paths(tmp_path: Path) -> None:
+    for name in ("a.pdb", "b.pdb", "c.pdb", "d.pdb"):
+        write_pdb(tmp_path / name, [("ALA", 1), ("GLY", 2)])
+    dataset = ProteinStructureDataset.from_folder(
+        tmp_path,
+        val_fraction=0.0,
+        recreate_indices=True,
+    )
+
+    batches = list(
+        dataset.iter_train_batches(
+            np.random.default_rng(1),
+            batch_size=2,
+            shuffle=False,
+        )
+    )
+
+    assert len(batches) == 2
+    assert tuple(path for batch in batches for path in batch) == dataset.train_paths
+
+
+def test_dataset_epoch_paths_can_repeat_beyond_split_size(tmp_path: Path) -> None:
+    for name in ("a.pdb", "b.pdb"):
+        write_pdb(tmp_path / name, [("ALA", 1), ("GLY", 2)])
+    dataset = ProteinStructureDataset.from_folder(
+        tmp_path,
+        val_fraction=0.0,
+        recreate_indices=True,
+    )
+
+    epoch_paths = dataset.train_epoch_paths(
+        np.random.default_rng(1),
+        episodes_per_epoch=5,
+        shuffle=False,
+    )
+
+    assert len(epoch_paths) == 5
+    assert epoch_paths == (
+        dataset.train_paths[0],
+        dataset.train_paths[1],
+        dataset.train_paths[0],
+        dataset.train_paths[1],
+        dataset.train_paths[0],
+    )
+
+
 def test_protein_preprocessing_filters_dna_structures(tmp_path: Path) -> None:
     protein = tmp_path / "protein.pdb"
     dna = tmp_path / "dna.pdb"
@@ -70,6 +125,26 @@ def test_protein_preprocessing_filters_dna_structures(tmp_path: Path) -> None:
 
     valid = filter_protein_structure_files([protein, dna, mixed])
     assert [path.name for path in valid] == ["mixed.pdb", "protein.pdb"]
+
+
+def test_protein_preprocessing_filters_backbone_incomplete_structures(tmp_path: Path) -> None:
+    complete = tmp_path / "complete.pdb"
+    incomplete = tmp_path / "incomplete.pdb"
+    write_pdb(complete, [("ALA", 1), ("GLY", 2)])
+    write_pdb(incomplete, [("ALA", 1), ("GLY", 2)], atoms=("CA",))
+
+    assert backbone_missing_fraction(complete) == 0.0
+    assert backbone_missing_fraction(incomplete) == 1.0
+    assert is_protein_structure_file(complete)
+    assert not is_protein_structure_file(incomplete)
+
+    dataset = ProteinStructureDataset.from_folder(
+        tmp_path,
+        recreate_indices=True,
+        val_fraction=0.0,
+    )
+
+    assert dataset.train_paths == (complete.resolve(),)
 
 
 def test_dataset_split_uses_only_preprocessed_protein_files(tmp_path: Path) -> None:

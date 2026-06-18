@@ -39,6 +39,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 import copy
 import json
 import logging
+import tempfile
 import time
 
 import numpy as np
@@ -122,6 +123,8 @@ AA_ONE_TO_THREE: Mapping[str, str] = {
     "W": "TRP",
     "Y": "TYR",
 }
+CANONICAL_RESIDUE_NAMES: frozenset[str] = frozenset(AA_ONE_TO_THREE.values())
+PDB_BACKBONE_ATOMS: Tuple[str, ...] = ("N", "CA", "C", "O")
 
 ObservationEncoder = Callable[[Any, "MechanicalProteinEnv"], np.ndarray]
 
@@ -159,6 +162,30 @@ class TransitionRecord:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class PDBCleaningResult:
+    """Summary of PDB text cleaning performed before PyRosetta loading."""
+
+    original_path: Path
+    load_path: Path
+    cleaned_path: Optional[Path]
+    total_residues: int
+    kept_residues: int
+    skipped_noncanonical_residues: int
+    skipped_missing_backbone_residues: int
+
+    @property
+    def skipped_residues(self) -> int:
+        return self.skipped_noncanonical_residues + self.skipped_missing_backbone_residues
+
+    @property
+    def missing_backbone_fraction(self) -> float:
+        canonical_total = self.kept_residues + self.skipped_missing_backbone_residues
+        if canonical_total == 0:
+            return 1.0
+        return float(self.skipped_missing_backbone_residues / canonical_total)
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +247,15 @@ class PyRosettaPoseBackend:
         pyrosetta_init_options: str = "-mute all",
         minimization_type: str = "lbfgs_armijo_nonmonotone",
         minimization_tolerance: float = 1e-3,
+        clean_pdb_before_load: bool = True,
+        max_missing_backbone_fraction: float = 0.05,
+        keep_cleaned_pdbs: bool = False,
+        cleaned_pdb_dir: Optional[str] = None,
     ) -> None:
         if minimization_tolerance <= 0:
             raise ValueError("minimization_tolerance must be > 0.")
+        if not 0.0 <= float(max_missing_backbone_fraction) <= 1.0:
+            raise ValueError("max_missing_backbone_fraction must satisfy 0 <= value <= 1.")
 
         started = time.perf_counter()
         LOGGER.info("Importing PyRosetta backend options=%s", pyrosetta_init_options)
@@ -240,10 +273,21 @@ class PyRosettaPoseBackend:
         self.scorefxn = scorefxn if scorefxn is not None else pyrosetta.get_fa_scorefxn()
         self.minimization_type = str(minimization_type)
         self.minimization_tolerance = float(minimization_tolerance)
+        self.clean_pdb_before_load = bool(clean_pdb_before_load)
+        self.max_missing_backbone_fraction = float(max_missing_backbone_fraction)
+        self.keep_cleaned_pdbs = bool(keep_cleaned_pdbs)
+        self.cleaned_pdb_dir = (
+            None if cleaned_pdb_dir is None else Path(cleaned_pdb_dir).expanduser().resolve()
+        )
+        if self.cleaned_pdb_dir is not None:
+            self.cleaned_pdb_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info(
-            "PyRosetta backend ready minimization_type=%s tolerance=%s elapsed_sec=%.3f",
+            "PyRosetta backend ready minimization_type=%s tolerance=%s "
+            "clean_pdb_before_load=%s max_missing_backbone_fraction=%.4f elapsed_sec=%.3f",
             self.minimization_type,
             self.minimization_tolerance,
+            self.clean_pdb_before_load,
+            self.max_missing_backbone_fraction,
             time.perf_counter() - started,
         )
 
@@ -265,15 +309,186 @@ class PyRosettaPoseBackend:
         if not path.is_file():
             raise FileNotFoundError(f"Initial PDB file does not exist: {path}")
         started = time.perf_counter()
-        LOGGER.info("Loading pose from PDB path=%s", path)
-        pose = self.pyrosetta.pose_from_pdb(str(path))
+        cleaning_result = self._prepare_pdb_for_load(path)
         LOGGER.info(
-            "Loaded pose path=%s residues=%s elapsed_sec=%.3f",
+            "Loading pose from PDB path=%s source_path=%s cleaned=%s kept_residues=%s "
+            "skipped_noncanonical=%s skipped_missing_backbone=%s",
+            cleaning_result.load_path,
+            cleaning_result.original_path,
+            cleaning_result.cleaned_path is not None,
+            cleaning_result.kept_residues,
+            cleaning_result.skipped_noncanonical_residues,
+            cleaning_result.skipped_missing_backbone_residues,
+        )
+        try:
+            pose = self.pyrosetta.pose_from_pdb(str(cleaning_result.load_path))
+        except Exception as exc:
+            raise RuntimeError(
+                "PyRosetta failed to load PDB after environment preprocessing. "
+                f"source_path={cleaning_result.original_path} "
+                f"load_path={cleaning_result.load_path} "
+                f"kept_residues={cleaning_result.kept_residues} "
+                f"skipped_noncanonical={cleaning_result.skipped_noncanonical_residues} "
+                f"skipped_missing_backbone={cleaning_result.skipped_missing_backbone_residues}"
+            ) from exc
+        finally:
+            if (
+                cleaning_result.cleaned_path is not None
+                and not self.keep_cleaned_pdbs
+                and cleaning_result.cleaned_path.exists()
+            ):
+                cleaning_result.cleaned_path.unlink()
+        LOGGER.info(
+            "Loaded pose path=%s source_path=%s residues=%s elapsed_sec=%.3f",
+            cleaning_result.load_path,
             path,
             int(pose.total_residue()),
             time.perf_counter() - started,
         )
         return pose
+
+    def _prepare_pdb_for_load(self, path: Path) -> PDBCleaningResult:
+        if not self.clean_pdb_before_load:
+            return PDBCleaningResult(
+                original_path=path,
+                load_path=path,
+                cleaned_path=None,
+                total_residues=0,
+                kept_residues=0,
+                skipped_noncanonical_residues=0,
+                skipped_missing_backbone_residues=0,
+            )
+        return self._clean_pdb_for_rosetta(path)
+
+    @staticmethod
+    def _pdb_residue_key(line: str) -> Tuple[str, str, str]:
+        return (line[21:22], line[22:26], line[26:27])
+
+    @staticmethod
+    def _renumber_atom_line(line: str, atom_serial: int) -> str:
+        if len(line) < 11:
+            return line
+        return f"{line[:6]}{atom_serial:5d}{line[11:]}"
+
+    def _clean_pdb_for_rosetta(self, path: Path) -> PDBCleaningResult:
+        header_lines: List[str] = []
+        residue_order: List[Tuple[str, str, str]] = []
+        residue_lines: Dict[Tuple[str, str, str], List[str]] = {}
+        residue_names: Dict[Tuple[str, str, str], str] = {}
+        residue_atoms: Dict[Tuple[str, str, str], set[str]] = {}
+
+        with path.open("r", encoding="utf-8", errors="ignore") as file:
+            for line in file:
+                record = line[:6].strip().upper()
+                if record == "ATOM":
+                    key = self._pdb_residue_key(line)
+                    if key not in residue_lines:
+                        residue_order.append(key)
+                        residue_lines[key] = []
+                        residue_atoms[key] = set()
+                        residue_names[key] = line[17:20].strip().upper()
+                    residue_lines[key].append(line if line.endswith("\n") else f"{line}\n")
+                    residue_atoms[key].add(line[12:16].strip().upper())
+                elif record in {"HEADER", "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA", "AUTHOR", "REMARK"}:
+                    header_lines.append(line if line.endswith("\n") else f"{line}\n")
+
+        kept_keys: List[Tuple[str, str, str]] = []
+        skipped_noncanonical = 0
+        skipped_missing_backbone = 0
+        required_backbone = set(PDB_BACKBONE_ATOMS)
+        for key in residue_order:
+            residue_name = residue_names[key]
+            if residue_name not in CANONICAL_RESIDUE_NAMES:
+                skipped_noncanonical += 1
+                continue
+            if not required_backbone.issubset(residue_atoms[key]):
+                skipped_missing_backbone += 1
+                continue
+            kept_keys.append(key)
+
+        canonical_total = len(kept_keys) + skipped_missing_backbone
+        missing_fraction = 1.0 if canonical_total == 0 else skipped_missing_backbone / canonical_total
+        if not kept_keys:
+            raise ValueError(
+                f"PDB preprocessing removed all residues before PyRosetta load: {path}. "
+                f"total_residues={len(residue_order)} skipped_noncanonical={skipped_noncanonical} "
+                f"skipped_missing_backbone={skipped_missing_backbone}."
+            )
+        if missing_fraction > self.max_missing_backbone_fraction:
+            raise ValueError(
+                "PDB has too many canonical residues missing backbone atoms before PyRosetta load: "
+                f"path={path} missing_backbone_fraction={missing_fraction:.4f} "
+                f"max_missing_backbone_fraction={self.max_missing_backbone_fraction:.4f} "
+                f"kept_residues={len(kept_keys)} skipped_missing_backbone={skipped_missing_backbone}."
+            )
+
+        if skipped_noncanonical == 0 and skipped_missing_backbone == 0:
+            return PDBCleaningResult(
+                original_path=path,
+                load_path=path,
+                cleaned_path=None,
+                total_residues=len(residue_order),
+                kept_residues=len(kept_keys),
+                skipped_noncanonical_residues=0,
+                skipped_missing_backbone_residues=0,
+            )
+
+        cleaned_lines: List[str] = []
+        cleaned_lines.extend(header_lines)
+        atom_serial = 1
+        previous_chain: Optional[str] = None
+        for key in kept_keys:
+            chain_id = key[0]
+            if previous_chain is not None and chain_id != previous_chain:
+                cleaned_lines.append("TER\n")
+            for line in residue_lines[key]:
+                cleaned_lines.append(self._renumber_atom_line(line, atom_serial))
+                atom_serial += 1
+            previous_chain = chain_id
+        cleaned_lines.append("TER\n")
+        cleaned_lines.append("END\n")
+
+        if self.cleaned_pdb_dir is None:
+            handle = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".cleaned.pdb",
+                prefix=f"{path.stem}.",
+                delete=False,
+            )
+        else:
+            handle = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".cleaned.pdb",
+                prefix=f"{path.stem}.",
+                dir=self.cleaned_pdb_dir,
+                delete=False,
+            )
+        with handle:
+            handle.writelines(cleaned_lines)
+        cleaned_path = Path(handle.name).resolve()
+        LOGGER.warning(
+            "Cleaned PDB before PyRosetta load source=%s cleaned=%s total_residues=%s "
+            "kept_residues=%s skipped_noncanonical=%s skipped_missing_backbone=%s "
+            "missing_backbone_fraction=%.4f",
+            path,
+            cleaned_path,
+            len(residue_order),
+            len(kept_keys),
+            skipped_noncanonical,
+            skipped_missing_backbone,
+            missing_fraction,
+        )
+        return PDBCleaningResult(
+            original_path=path,
+            load_path=cleaned_path,
+            cleaned_path=cleaned_path,
+            total_residues=len(residue_order),
+            kept_residues=len(kept_keys),
+            skipped_noncanonical_residues=skipped_noncanonical,
+            skipped_missing_backbone_residues=skipped_missing_backbone,
+        )
 
     @staticmethod
     def clone_pose(pose: Any) -> Any:
@@ -537,6 +752,10 @@ class MechanicalProteinEnv(_GymEnvBase):
         truncate_when_no_valid_actions: bool = True,
         backend: Optional[PoseBackend] = None,
         pyrosetta_init_options: str = "-mute all",
+        clean_pdb_before_load: bool = True,
+        load_max_missing_backbone_fraction: float = 0.05,
+        keep_cleaned_pdbs: bool = False,
+        cleaned_pdb_dir: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
         started = time.perf_counter()
@@ -590,7 +809,13 @@ class MechanicalProteinEnv(_GymEnvBase):
         self.backend: PoseBackend = (
             backend
             if backend is not None
-            else PyRosettaPoseBackend(pyrosetta_init_options=pyrosetta_init_options)
+            else PyRosettaPoseBackend(
+                pyrosetta_init_options=pyrosetta_init_options,
+                clean_pdb_before_load=clean_pdb_before_load,
+                max_missing_backbone_fraction=load_max_missing_backbone_fraction,
+                keep_cleaned_pdbs=keep_cleaned_pdbs,
+                cleaned_pdb_dir=cleaned_pdb_dir,
+            )
         )
 
         self.reference_pose: Any = None

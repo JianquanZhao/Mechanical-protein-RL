@@ -1,5 +1,6 @@
 from .dataset import (
     ProteinStructureDataset,
+    backbone_missing_fraction,
     count_canonical_protein_residues,
     discover_structure_files,
     filter_protein_structure_files,
@@ -8,6 +9,7 @@ from .dataset import (
 
 __all__ = [
     "ProteinStructureDataset",
+    "backbone_missing_fraction",
     "count_canonical_protein_residues",
     "discover_structure_files",
     "filter_protein_structure_files",

@@ -10,7 +10,7 @@ Single machine, multiple GPUs:
     python training.py --mode multi --gpu-ids 0,1
 
 CPU/debug run:
-    python training.py --mode single --device cpu --episodes 2 --max-steps 1
+    python training.py --mode single --device cpu --epochs 1 --max-steps 1
 """
 
 from __future__ import annotations
@@ -79,8 +79,54 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Minimum canonical protein residues required for a structure file to enter train/val splits.",
     )
+    parser.add_argument(
+        "--max-missing-backbone-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum fraction of canonical protein residues allowed to miss "
+            "N/CA/C/O atoms during dataset preprocessing."
+        ),
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--episodes", type=int, default=500)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=500,
+        help=(
+            "Legacy total episode count. Used only when --epochs is omitted. "
+            "Prefer --epochs for dataset-style multi-batch training."
+        ),
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help=(
+            "Number of dataset training epochs. Each epoch iterates over train PDB "
+            "batches and runs one RL episode per selected PDB."
+        ),
+    )
+    parser.add_argument(
+        "--episodes-per-epoch",
+        type=int,
+        default=None,
+        help=(
+            "Number of PDB episodes sampled in each epoch. Defaults to the full "
+            "training split size. Values larger than the split repeat shuffled cycles."
+        ),
+    )
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=1,
+        help="Number of PDB episodes grouped into one dataset batch inside each epoch.",
+    )
+    parser.add_argument(
+        "--no-shuffle-train",
+        action="store_true",
+        help="Disable shuffling of train PDB paths within each dataset epoch.",
+    )
     parser.add_argument("--max-steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -90,6 +136,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local-repack-radius", type=float, default=8.0)
     parser.add_argument("--pyrosetta-options", default="-mute all")
+    parser.add_argument(
+        "--no-clean-pdb-before-load",
+        action="store_true",
+        help="Disable environment-side PDB text cleaning before PyRosetta pose_from_pdb.",
+    )
+    parser.add_argument(
+        "--keep-cleaned-pdbs",
+        action="store_true",
+        help="Keep temporary cleaned PDB files generated before PyRosetta loading.",
+    )
+    parser.add_argument(
+        "--cleaned-pdb-dir",
+        default=None,
+        help="Optional directory for cleaned PDB files when --keep-cleaned-pdbs is enabled.",
+    )
+    parser.add_argument(
+        "--rmsd-missing-atom-policy",
+        choices=("raise", "skip_residue", "penalize"),
+        default="penalize",
+        help=(
+            "How StepRewardCalculator handles residues missing local-RMSD atoms. "
+            "'penalize' is recommended for long mixed-quality training runs."
+        ),
+    )
+    parser.add_argument("--rmsd-missing-penalty", type=float, default=5.0)
+    parser.add_argument("--min-rmsd-atoms", type=int, default=3)
     parser.add_argument(
         "--observation-encoder",
         choices=("default", "esm2"),
@@ -257,7 +329,16 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         prevent_revisit_positions=args.prevent_revisit_positions,
         raise_on_update_error=args.raise_on_update_error,
         observation_encoder=observation_encoder,
+        step_reward_kwargs={
+            "rmsd_missing_atom_policy": args.rmsd_missing_atom_policy,
+            "rmsd_missing_penalty": args.rmsd_missing_penalty,
+            "min_rmsd_atoms": args.min_rmsd_atoms,
+        },
         pyrosetta_init_options=args.pyrosetta_options,
+        clean_pdb_before_load=not args.no_clean_pdb_before_load,
+        load_max_missing_backbone_fraction=args.max_missing_backbone_fraction,
+        keep_cleaned_pdbs=args.keep_cleaned_pdbs,
+        cleaned_pdb_dir=args.cleaned_pdb_dir,
         seed=args.seed,
     )
 
@@ -271,6 +352,7 @@ def build_dataset(args: argparse.Namespace) -> ProteinStructureDataset:
         seed=args.dataset_seed,
         recreate_indices=args.recreate_splits,
         min_protein_residues=args.min_protein_residues,
+        max_missing_backbone_fraction=args.max_missing_backbone_fraction,
     )
 
 
@@ -423,9 +505,71 @@ def run_validation(
     return records
 
 
+def validate_training_schedule_args(args: argparse.Namespace) -> None:
+    if args.epochs is not None and int(args.epochs) <= 0:
+        raise ValueError("--epochs must be a positive integer when supplied.")
+    if args.episodes_per_epoch is not None and int(args.episodes_per_epoch) <= 0:
+        raise ValueError("--episodes-per-epoch must be a positive integer when supplied.")
+    if int(args.train_batch_size) <= 0:
+        raise ValueError("--train-batch-size must be a positive integer.")
+    if args.epochs is None and int(args.episodes) <= 0:
+        raise ValueError("--episodes must be a positive integer in legacy episode mode.")
+
+
+def planned_episode_count(args: argparse.Namespace, dataset: ProteinStructureDataset) -> int:
+    if args.epochs is None:
+        return int(args.episodes)
+    episodes_per_epoch = (
+        len(dataset.train_paths)
+        if args.episodes_per_epoch is None
+        else int(args.episodes_per_epoch)
+    )
+    return int(args.epochs) * episodes_per_epoch
+
+
+def iter_training_episode_paths(
+    *,
+    args: argparse.Namespace,
+    dataset: ProteinStructureDataset,
+    rng: np.random.Generator,
+) -> Iterable[tuple[int, int, int, Path]]:
+    """Yield (epoch, batch_index, batch_item_index, pdb_path)."""
+
+    if args.epochs is None:
+        for episode in range(int(args.episodes)):
+            yield 0, episode, 0, dataset.sample_train_path(rng)
+        return
+
+    episodes_per_epoch = (
+        len(dataset.train_paths)
+        if args.episodes_per_epoch is None
+        else int(args.episodes_per_epoch)
+    )
+    for epoch in range(int(args.epochs)):
+        for batch_index, batch_paths in enumerate(
+            dataset.iter_train_batches(
+                rng,
+                batch_size=args.train_batch_size,
+                episodes_per_epoch=episodes_per_epoch,
+                shuffle=not args.no_shuffle_train,
+            )
+        ):
+            LOGGER.info(
+                "Dataset batch ready epoch=%s/%s batch=%s batch_size=%s paths=%s",
+                epoch + 1,
+                int(args.epochs),
+                batch_index,
+                len(batch_paths),
+                [str(path) for path in batch_paths],
+            )
+            for batch_item_index, pdb_path in enumerate(batch_paths):
+                yield epoch, batch_index, batch_item_index, pdb_path
+
+
 def train(args: argparse.Namespace) -> None:
     if args.log_every_steps <= 0:
         raise ValueError("--log-every-steps must be a positive integer.")
+    validate_training_schedule_args(args)
 
     run_started = time.perf_counter()
     output_dir = Path(args.output_dir)
@@ -444,13 +588,22 @@ def train(args: argparse.Namespace) -> None:
 
     dataset = build_dataset(args)
     dataset_rng = np.random.default_rng(args.dataset_seed)
+    total_planned_episodes = planned_episode_count(args, dataset)
     LOGGER.info(
-        "Dataset ready train_size=%s val_size=%s train_index=%s val_index=%s min_protein_residues=%s",
+        "Dataset ready train_size=%s val_size=%s train_index=%s val_index=%s "
+        "min_protein_residues=%s max_missing_backbone_fraction=%.4f "
+        "training_schedule=%s planned_episodes=%s epochs=%s episodes_per_epoch=%s train_batch_size=%s",
         len(dataset.train_paths),
         len(dataset.val_paths),
         dataset.train_index_path,
         dataset.val_index_path,
         dataset.min_protein_residues,
+        dataset.max_missing_backbone_fraction,
+        "legacy_episodes" if args.epochs is None else "dataset_epochs",
+        total_planned_episodes,
+        args.epochs,
+        args.episodes_per_epoch if args.episodes_per_epoch is not None else len(dataset.train_paths),
+        args.train_batch_size,
     )
 
     device, gpu_ids = configure_training_mode(args)
@@ -522,14 +675,26 @@ def train(args: argparse.Namespace) -> None:
     total_environment_steps = 0
 
     try:
-        for episode in range(args.episodes):
+        for episode, (epoch, batch_index, batch_item_index, episode_pdb_path) in enumerate(
+            iter_training_episode_paths(args=args, dataset=dataset, rng=dataset_rng)
+        ):
             episode_started = time.perf_counter()
-            LOGGER.info("Episode %s/%s starting", episode + 1, args.episodes)
-            episode_pdb_path = dataset.sample_train_path(dataset_rng)
+            LOGGER.info(
+                "Episode %s/%s starting epoch=%s batch=%s batch_item=%s",
+                episode + 1,
+                total_planned_episodes,
+                epoch,
+                batch_index,
+                batch_item_index,
+            )
             state, info = env.reset(pdb_path=str(episode_pdb_path))
             LOGGER.info(
-                "Episode %s reset pdb_path=%s valid_actions=%s accepted_mutations=%s",
+                "Episode %s reset epoch=%s batch=%s batch_item=%s pdb_path=%s "
+                "valid_actions=%s accepted_mutations=%s",
                 episode,
+                epoch,
+                batch_index,
+                batch_item_index,
                 episode_pdb_path,
                 info.get("valid_action_count"),
                 info.get("accepted_mutation_count"),
@@ -668,6 +833,11 @@ def train(args: argparse.Namespace) -> None:
                 extra={
                     "candidate_pdb": None if candidate_path is None else str(candidate_path),
                     "source_pdb": str(episode_pdb_path),
+                    "epoch": epoch,
+                    "batch_index": batch_index,
+                    "batch_item_index": batch_item_index,
+                    "planned_episodes": total_planned_episodes,
+                    "training_schedule": "legacy_episodes" if args.epochs is None else "dataset_epochs",
                     "mode": args.mode,
                     "device": str(agent.device),
                     "gpu_ids": list(gpu_ids),
@@ -707,9 +877,13 @@ def train(args: argparse.Namespace) -> None:
                 LOGGER.info("Periodic checkpoint complete episode=%s dir=%s", episode, checkpoint_dir)
 
             LOGGER.info(
-                "Episode summary episode=%s reward=%.4f steps=%s "
+                "Episode summary episode=%s/%s epoch=%s batch=%s batch_item=%s reward=%.4f steps=%s "
                 "epsilon=%.4f optim_steps=%s elapsed_sec=%.3f",
                 episode,
+                total_planned_episodes,
+                epoch,
+                batch_index,
+                batch_item_index,
                 episode_reward,
                 episode_steps,
                 agent.epsilon,

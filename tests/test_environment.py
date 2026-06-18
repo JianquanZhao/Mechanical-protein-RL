@@ -13,6 +13,7 @@ import pytest
 from model.environment_module.environment import (
     CANONICAL_AMINO_ACIDS,
     MechanicalProteinEnv,
+    PyRosettaPoseBackend,
 )
 
 
@@ -100,6 +101,81 @@ def make_env(**kwargs) -> MechanicalProteinEnv:
 
 def action_for(env: MechanicalProteinEnv, mutable_index: int, aa: str) -> int:
     return mutable_index * env.n_amino_acids + env.amino_acids.index(aa)
+
+
+def make_backend_cleaner(tmp_path: Path, *, max_missing_fraction: float = 0.5) -> PyRosettaPoseBackend:
+    backend = PyRosettaPoseBackend.__new__(PyRosettaPoseBackend)
+    backend.clean_pdb_before_load = True
+    backend.max_missing_backbone_fraction = max_missing_fraction
+    backend.keep_cleaned_pdbs = True
+    backend.cleaned_pdb_dir = tmp_path
+    return backend
+
+
+def write_atom_line(
+    *,
+    serial: int,
+    atom_name: str,
+    residue_name: str,
+    chain_id: str,
+    residue_number: int,
+) -> str:
+    return (
+        f"ATOM  {serial:5d} {atom_name:>4s} {residue_name:>3s} {chain_id}{residue_number:4d}"
+        "      11.104  13.207   9.447  1.00 20.00           C\n"
+    )
+
+
+def write_environment_pdb(path: Path) -> None:
+    lines = []
+    serial = 1
+    for residue_name, residue_number, atoms in (
+        ("ALA", 1, ("N", "CA", "C", "O")),
+        ("ACY", 2, ("CA",)),
+        ("GLY", 3, ("CA",)),
+        ("SER", 4, ("N", "CA", "C", "O")),
+    ):
+        for atom_name in atoms:
+            lines.append(
+                write_atom_line(
+                    serial=serial,
+                    atom_name=atom_name,
+                    residue_name=residue_name,
+                    chain_id="A",
+                    residue_number=residue_number,
+                )
+            )
+            serial += 1
+    lines.append("END\n")
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def test_backend_clean_pdb_for_rosetta_removes_noncanonical_and_missing_backbone(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "dirty.pdb"
+    write_environment_pdb(source_path)
+    backend = make_backend_cleaner(tmp_path, max_missing_fraction=0.5)
+
+    result = backend._clean_pdb_for_rosetta(source_path)
+
+    cleaned_text = result.load_path.read_text(encoding="utf-8")
+    assert result.kept_residues == 2
+    assert result.skipped_noncanonical_residues == 1
+    assert result.skipped_missing_backbone_residues == 1
+    assert "ALA" in cleaned_text
+    assert "SER" in cleaned_text
+    assert "ACY" not in cleaned_text
+    assert "GLY" not in cleaned_text
+
+
+def test_backend_clean_pdb_rejects_too_many_missing_backbone_atoms(tmp_path: Path) -> None:
+    source_path = tmp_path / "dirty.pdb"
+    write_environment_pdb(source_path)
+    backend = make_backend_cleaner(tmp_path, max_missing_fraction=0.1)
+
+    with pytest.raises(ValueError, match="too many canonical residues missing backbone"):
+        backend._clean_pdb_for_rosetta(source_path)
 
 
 def test_load_reset_and_default_observation_shape() -> None:

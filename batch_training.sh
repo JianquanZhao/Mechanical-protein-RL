@@ -1,5 +1,4 @@
 python training.py \
-  --pdb-dir /mnt/data2/jianquanzhao/data/tsinghua/data/datasets/rcsb/rens \
   --mode single \
   --device cuda:0 \
   --episodes 1000 \
@@ -11,4 +10,11 @@ python training.py \
   --checkpoint-every 128 \
   --no-resume-logs \
   --validate-every 1 \
-  --log-level INFO
+  --log-level INFO \
+  --observation-encoder esm2 \
+  --esm2-device cuda:0 \
+  --keep-cleaned-pdbs \
+  --pdb-dir /mnt/nas/jianquanzhao/data/mprl/outputs/cleaned_pdb_debug \
+  --epochs 10 \
+  --episodes-per-epoch 1024 \
+  --train-batch-size 64 \
