@@ -1,12 +1,14 @@
 python training.py \
+  --pdb-dir /mnt/data2/jianquanzhao/data/tsinghua/data/datasets/rcsb/rens \
   --mode single \
   --device cuda:0 \
-  --episodes 10 \
-  --max-steps 1000 \
-  --output-dir /tmp/mprl-variable-replay-smoke \
-  --replay-warmup-size 1 \
-  --micro-batch-size 2 \
-  --gradient-accumulation-steps 2 \
-  --checkpoint-every 2 \
+  --episodes 1000 \
+  --max-steps 100 \
+  --output-dir /tmp/mprl-dataset-folder-smoke \
+  --replay-warmup-size 1000 \
+  --micro-batch-size 16 \
+  --gradient-accumulation-steps 4 \
+  --checkpoint-every 128 \
   --no-resume-logs \
+  --validate-every 1 \
   --log-level INFO

@@ -18,6 +18,30 @@ import numpy as np
 PathLike = Union[str, Path]
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EXTENSIONS = (".pdb", ".ent")
+CANONICAL_PROTEIN_RESIDUES = frozenset(
+    {
+        "ALA",
+        "ARG",
+        "ASN",
+        "ASP",
+        "CYS",
+        "GLN",
+        "GLU",
+        "GLY",
+        "HIS",
+        "ILE",
+        "LEU",
+        "LYS",
+        "MET",
+        "PHE",
+        "PRO",
+        "SER",
+        "THR",
+        "TRP",
+        "TYR",
+        "VAL",
+    }
+)
 
 
 def discover_structure_files(
@@ -45,6 +69,77 @@ def discover_structure_files(
     return files
 
 
+def count_canonical_protein_residues(path: PathLike) -> int:
+    """Count unique canonical protein residues from PDB ATOM records."""
+
+    residue_ids = set()
+    path = Path(path).expanduser().resolve()
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as file:
+            for line in file:
+                if not line.startswith("ATOM"):
+                    continue
+                residue_name = line[17:20].strip().upper()
+                if residue_name not in CANONICAL_PROTEIN_RESIDUES:
+                    continue
+                chain_id = line[21:22].strip()
+                residue_number = line[22:26].strip()
+                insertion_code = line[26:27].strip()
+                residue_ids.add((chain_id, residue_number, insertion_code, residue_name))
+    except OSError as exc:
+        LOGGER.warning("Skipping unreadable structure file path=%s error=%s", path, exc)
+        return 0
+    return len(residue_ids)
+
+
+def is_protein_structure_file(path: PathLike, *, min_protein_residues: int = 1) -> bool:
+    """Return True when ``path`` contains enough canonical protein residues."""
+
+    if int(min_protein_residues) <= 0:
+        raise ValueError("min_protein_residues must be a positive integer.")
+    residue_count = count_canonical_protein_residues(path)
+    is_valid = residue_count >= int(min_protein_residues)
+    if not is_valid:
+        LOGGER.info(
+            "Filtered non-protein or invalid structure path=%s canonical_residues=%s required=%s",
+            Path(path).expanduser(),
+            residue_count,
+            min_protein_residues,
+        )
+    return is_valid
+
+
+def filter_protein_structure_files(
+    files: Sequence[Path],
+    *,
+    min_protein_residues: int = 1,
+    require_non_empty: bool = True,
+) -> List[Path]:
+    """Keep only PDB-like files that contain canonical protein residues."""
+
+    valid: List[Path] = []
+    invalid_count = 0
+    for path in files:
+        if is_protein_structure_file(path, min_protein_residues=min_protein_residues):
+            valid.append(Path(path).expanduser().resolve())
+        else:
+            invalid_count += 1
+
+    LOGGER.info(
+        "Protein structure preprocessing complete total=%s valid=%s filtered=%s min_residues=%s",
+        len(files),
+        len(valid),
+        invalid_count,
+        min_protein_residues,
+    )
+    if require_non_empty and not valid:
+        raise FileNotFoundError(
+            "No valid protein structure files were found after preprocessing. "
+            f"min_protein_residues={min_protein_residues}"
+        )
+    return sorted(valid)
+
+
 @dataclass(frozen=True)
 class ProteinStructureDataset:
     """Train/validation split over a directory of PDB-like structure files."""
@@ -54,6 +149,7 @@ class ProteinStructureDataset:
     val_paths: Tuple[Path, ...]
     train_index_path: Path
     val_index_path: Path
+    min_protein_residues: int = 1
 
     @classmethod
     def from_folder(
@@ -66,6 +162,7 @@ class ProteinStructureDataset:
         seed: int = 7,
         extensions: Sequence[str] = DEFAULT_EXTENSIONS,
         recreate_indices: bool = False,
+        min_protein_residues: int = 1,
     ) -> "ProteinStructureDataset":
         root = Path(pdb_dir).expanduser().resolve()
         train_index = (
@@ -79,14 +176,29 @@ class ProteinStructureDataset:
             else Path(val_index_path).expanduser().resolve()
         )
 
+        if int(min_protein_residues) <= 0:
+            raise ValueError("min_protein_residues must be a positive integer.")
+
         if recreate_indices or not train_index.exists() or not val_index.exists():
-            files = discover_structure_files(root, extensions=extensions)
+            discovered_files = discover_structure_files(root, extensions=extensions)
+            files = filter_protein_structure_files(
+                discovered_files,
+                min_protein_residues=min_protein_residues,
+            )
             train_paths, val_paths = cls._split(files, val_fraction=val_fraction, seed=seed)
             cls._write_index(root, train_index, train_paths)
             cls._write_index(root, val_index, val_paths)
         else:
-            train_paths = cls._read_index(root, train_index)
-            val_paths = cls._read_index(root, val_index)
+            train_paths = cls._preprocess_index_paths(
+                root,
+                train_index,
+                min_protein_residues=min_protein_residues,
+            )
+            val_paths = cls._preprocess_index_paths(
+                root,
+                val_index,
+                min_protein_residues=min_protein_residues,
+            )
 
         if not train_paths:
             raise ValueError("Training split is empty.")
@@ -104,6 +216,7 @@ class ProteinStructureDataset:
             val_paths=tuple(val_paths),
             train_index_path=train_index,
             val_index_path=val_index,
+            min_protein_residues=int(min_protein_residues),
         )
 
     def sample_train_path(self, rng: np.random.Generator) -> Path:
@@ -167,3 +280,27 @@ class ProteinStructureDataset:
             paths.append(path)
         LOGGER.info("Read dataset index path=%s rows=%s", index_path, len(paths))
         return paths
+
+    @classmethod
+    def _preprocess_index_paths(
+        cls,
+        root: Path,
+        index_path: Path,
+        *,
+        min_protein_residues: int,
+    ) -> List[Path]:
+        paths = cls._read_index(root, index_path)
+        valid_paths = filter_protein_structure_files(
+            paths,
+            min_protein_residues=min_protein_residues,
+            require_non_empty=False,
+        )
+        if len(valid_paths) != len(paths):
+            LOGGER.warning(
+                "Rewriting dataset index after protein preprocessing path=%s before=%s after=%s",
+                index_path,
+                len(paths),
+                len(valid_paths),
+            )
+            cls._write_index(root, index_path, valid_paths)
+        return valid_paths
