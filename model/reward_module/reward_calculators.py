@@ -30,9 +30,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple, Union
+import logging
 
 import numpy as np
 
+LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared helper types
@@ -132,6 +134,9 @@ class StepRewardResult:
     local_rmsd_to_previous: float
     local_rmsd_to_reference: float
     local_rmsd_used: float
+    local_rmsd_status: str
+    local_rmsd_atom_count: int
+    skipped_local_rmsd_residues: Tuple[int, ...]
     local_residues: Tuple[int, ...]
 
     # Weighted scalar-reward components
@@ -230,10 +235,20 @@ class StepRewardCalculator:
         "absolute" penalizes the full current collision score.
     include_fa_intra_rep:
         If True, add weighted fa_intra_rep to weighted fa_rep.
+    rmsd_missing_atom_policy:
+        "raise" fails on missing RMSD atoms. "skip_residue" ignores local
+        residues missing required atoms in either pose. "penalize" ignores
+        incomplete residues when enough atoms remain and returns
+        rmsd_missing_penalty when too few atoms remain after skipping.
+    rmsd_missing_penalty:
+        Local RMSD value used by "penalize" when RMSD cannot be calculated.
+    min_rmsd_atoms:
+        Minimum atom count required for superposed local RMSD.
     """
 
     _VALID_RMSD_MODES = {"previous", "reference"}
     _VALID_COLLISION_MODES = {"delta", "excess_over_reference", "absolute"}
+    _VALID_RMSD_MISSING_ATOM_POLICIES = {"raise", "skip_residue", "penalize"}
 
     def __init__(
         self,
@@ -248,6 +263,9 @@ class StepRewardCalculator:
         rmsd_penalty_mode: str = "previous",
         collision_penalty_mode: str = "delta",
         include_fa_intra_rep: bool = False,
+        rmsd_missing_atom_policy: str = "penalize",
+        rmsd_missing_penalty: float = 5.0,
+        min_rmsd_atoms: int = 3,
     ) -> None:
         pyrosetta, score_type_from_name = self._import_pyrosetta()
 
@@ -266,6 +284,15 @@ class StepRewardCalculator:
                 "collision_penalty_mode must be one of "
                 f"{sorted(self._VALID_COLLISION_MODES)}."
             )
+        if rmsd_missing_atom_policy not in self._VALID_RMSD_MISSING_ATOM_POLICIES:
+            raise ValueError(
+                "rmsd_missing_atom_policy must be one of "
+                f"{sorted(self._VALID_RMSD_MISSING_ATOM_POLICIES)}."
+            )
+        if rmsd_missing_penalty < 0:
+            raise ValueError("rmsd_missing_penalty must be >= 0.")
+        if int(min_rmsd_atoms) < 3:
+            raise ValueError("min_rmsd_atoms must be >= 3.")
 
         scales.validate()
 
@@ -280,6 +307,9 @@ class StepRewardCalculator:
         self.rmsd_penalty_mode = rmsd_penalty_mode
         self.collision_penalty_mode = collision_penalty_mode
         self.include_fa_intra_rep = bool(include_fa_intra_rep)
+        self.rmsd_missing_atom_policy = rmsd_missing_atom_policy
+        self.rmsd_missing_penalty = float(rmsd_missing_penalty)
+        self.min_rmsd_atoms = int(min_rmsd_atoms)
 
         self.reference_collision_score = self._collision_score(self.reference_pose)
         self.reference_hbond_counts = self._count_hbonds(self.reference_pose)
@@ -430,12 +460,35 @@ class StepRewardCalculator:
                     )
                 coordinates.append(self._xyz_to_numpy(residue.xyz(atom_name)))
 
-        if len(coordinates) < 3:
+        if len(coordinates) < self.min_rmsd_atoms:
             raise ValueError(
-                "At least three atoms are required to calculate a superposed RMSD."
+                f"At least {self.min_rmsd_atoms} atoms are required to calculate a superposed RMSD."
             )
 
         return np.asarray(coordinates, dtype=float)
+
+    def _residue_has_rmsd_atoms(self, pose: Any, residue_index: int) -> bool:
+        residue = pose.residue(int(residue_index))
+        return all(residue.has(atom_name) for atom_name in self.rmsd_atom_names)
+
+    def _shared_rmsd_residues(
+        self,
+        reference_pose: Any,
+        mobile_pose: Any,
+        residue_indices: Sequence[int],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        usable = []
+        skipped = []
+        for residue_index in residue_indices:
+            residue_index = int(residue_index)
+            if self._residue_has_rmsd_atoms(reference_pose, residue_index) and self._residue_has_rmsd_atoms(
+                mobile_pose,
+                residue_index,
+            ):
+                usable.append(residue_index)
+            else:
+                skipped.append(residue_index)
+        return tuple(usable), tuple(skipped)
 
     @staticmethod
     def _kabsch_rmsd(reference_coordinates: np.ndarray, mobile_coordinates: np.ndarray) -> float:
@@ -475,14 +528,61 @@ class StepRewardCalculator:
         reference_pose: Any,
         mobile_pose: Any,
         residue_indices: Sequence[int],
-    ) -> float:
+    ) -> Tuple[float, str, int, Tuple[int, ...]]:
+        if self.rmsd_missing_atom_policy == "raise":
+            reference_coordinates = self._coordinates_for_local_rmsd(
+                reference_pose, residue_indices
+            )
+            mobile_coordinates = self._coordinates_for_local_rmsd(
+                mobile_pose, residue_indices
+            )
+            return (
+                self._kabsch_rmsd(reference_coordinates, mobile_coordinates),
+                "ok",
+                int(reference_coordinates.shape[0]),
+                tuple(),
+            )
+
+        usable_residues, skipped_residues = self._shared_rmsd_residues(
+            reference_pose,
+            mobile_pose,
+            residue_indices,
+        )
+        atom_count = len(usable_residues) * len(self.rmsd_atom_names)
+        if skipped_residues:
+            LOGGER.warning(
+                "Skipping residues with missing local RMSD atoms skipped_residues=%s usable_residues=%s",
+                skipped_residues,
+                usable_residues,
+            )
+        if atom_count < self.min_rmsd_atoms:
+            if self.rmsd_missing_atom_policy == "penalize":
+                LOGGER.warning(
+                    "Using local RMSD missing-atom penalty atom_count=%s min_rmsd_atoms=%s penalty=%s",
+                    atom_count,
+                    self.min_rmsd_atoms,
+                    self.rmsd_missing_penalty,
+                )
+                return self.rmsd_missing_penalty, "penalized_missing_atoms", atom_count, skipped_residues
+            raise ValueError(
+                "Not enough complete residues remain for local RMSD after skipping "
+                f"missing atoms: atom_count={atom_count}, min_rmsd_atoms={self.min_rmsd_atoms}, "
+                f"skipped_residues={skipped_residues}."
+            )
+
         reference_coordinates = self._coordinates_for_local_rmsd(
-            reference_pose, residue_indices
+            reference_pose, usable_residues
         )
         mobile_coordinates = self._coordinates_for_local_rmsd(
-            mobile_pose, residue_indices
+            mobile_pose, usable_residues
         )
-        return self._kabsch_rmsd(reference_coordinates, mobile_coordinates)
+        status = "skipped_missing_atoms" if skipped_residues else "ok"
+        return (
+            self._kabsch_rmsd(reference_coordinates, mobile_coordinates),
+            status,
+            int(reference_coordinates.shape[0]),
+            skipped_residues,
+        )
 
     def evaluate(
         self,
@@ -554,12 +654,22 @@ class StepRewardCalculator:
             - previous_hbonds.sidechain_involving
         )
 
-        local_rmsd_to_previous = self._local_rmsd(
+        (
+            local_rmsd_to_previous,
+            previous_rmsd_status,
+            previous_rmsd_atom_count,
+            previous_skipped_residues,
+        ) = self._local_rmsd(
             previous_pose,
             current_pose,
             local_residues_tuple,
         )
-        local_rmsd_to_reference = self._local_rmsd(
+        (
+            local_rmsd_to_reference,
+            reference_rmsd_status,
+            reference_rmsd_atom_count,
+            reference_skipped_residues,
+        ) = self._local_rmsd(
             self.reference_pose,
             current_pose,
             local_residues_tuple,
@@ -567,8 +677,16 @@ class StepRewardCalculator:
 
         if self.rmsd_penalty_mode == "previous":
             local_rmsd_used = local_rmsd_to_previous
+            local_rmsd_status = previous_rmsd_status
+            local_rmsd_atom_count = previous_rmsd_atom_count
         else:
             local_rmsd_used = local_rmsd_to_reference
+            local_rmsd_status = reference_rmsd_status
+            local_rmsd_atom_count = reference_rmsd_atom_count
+
+        skipped_local_rmsd_residues = tuple(
+            sorted(set(previous_skipped_residues) | set(reference_skipped_residues))
+        )
 
         components = {
             "collision": (
@@ -611,6 +729,9 @@ class StepRewardCalculator:
             local_rmsd_to_previous=float(local_rmsd_to_previous),
             local_rmsd_to_reference=float(local_rmsd_to_reference),
             local_rmsd_used=float(local_rmsd_used),
+            local_rmsd_status=local_rmsd_status,
+            local_rmsd_atom_count=int(local_rmsd_atom_count),
+            skipped_local_rmsd_residues=skipped_local_rmsd_residues,
             local_residues=local_residues_tuple,
             reward_components=components,
         )
