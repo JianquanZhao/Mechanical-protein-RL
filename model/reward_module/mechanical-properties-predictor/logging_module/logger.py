@@ -54,6 +54,9 @@ class PredictorLogger:
             self._writer.add_scalar("loss/val", val_loss, epoch)
             for key, value in metrics.items():
                 self._writer.add_scalar(f"metrics/{key}", value, epoch)
+                if "/" in key:
+                    split, metric_name = key.split("/", 1)
+                    self._writer.add_scalar(f"{split}/{metric_name}", value, epoch)
             self._writer.flush()
 
     def write_final_metrics(self, payload: Mapping) -> None:
@@ -109,13 +112,36 @@ class PredictorLogger:
             ylabel="MSE loss",
         )
         for metric in ("mean/r2", "mean/mae", "mean/rmse", "mean/spearman"):
-            if metric in records[-1]:
+            lines = {}
+            train_key = f"train/{metric}"
+            val_key = f"val/{metric}"
+            if train_key in records[-1]:
+                lines[train_key] = [record.get(train_key) for record in records]
+            if val_key in records[-1]:
+                lines[val_key] = [record.get(val_key) for record in records]
+            if lines:
                 self._plot_lines(
                     epochs,
-                    {metric: [record[metric] for record in records]},
+                    lines,
                     self.plots_dir / f"{metric.replace('/', '_')}.png",
                     ylabel=metric,
                 )
+        for target in ("strength", "toughness"):
+            for metric in ("r2", "mae", "rmse", "spearman"):
+                lines = {}
+                train_key = f"train/{target}/{metric}"
+                val_key = f"val/{target}/{metric}"
+                if train_key in records[-1]:
+                    lines[train_key] = [record.get(train_key) for record in records]
+                if val_key in records[-1]:
+                    lines[val_key] = [record.get(val_key) for record in records]
+                if lines:
+                    self._plot_lines(
+                        epochs,
+                        lines,
+                        self.plots_dir / f"{target}_{metric}.png",
+                        ylabel=f"{target}/{metric}",
+                    )
 
     @staticmethod
     def _plot_lines(epochs, lines: Mapping[str, list[float]], path: Path, *, ylabel: str) -> None:
@@ -123,7 +149,15 @@ class PredictorLogger:
 
         fig, ax = plt.subplots(figsize=(8, 4.5))
         for label, values in lines.items():
-            ax.plot(epochs, values, label=label)
+            filtered = [
+                (epoch, value)
+                for epoch, value in zip(epochs, values)
+                if value is not None
+            ]
+            if not filtered:
+                continue
+            line_epochs, line_values = zip(*filtered)
+            ax.plot(line_epochs, line_values, label=label)
         ax.set_xlabel("epoch")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)

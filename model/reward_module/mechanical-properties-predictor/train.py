@@ -61,7 +61,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--target-transform",
+        choices=("none", "log1p"),
+        default="log1p",
+        help="Transform strength/toughness targets before normalization and training.",
+    )
+    parser.add_argument(
+        "--loss",
+        choices=("mse", "huber"),
+        default="huber",
+        help="Regression loss in normalized transformed target space.",
+    )
+    parser.add_argument("--huber-beta", type=float, default=1.0)
+    parser.add_argument(
+        "--strength-loss-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for the strength target. Target order is strength, toughness.",
+    )
+    parser.add_argument(
+        "--toughness-loss-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for the toughness target. Target order is strength, toughness.",
+    )
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument(
+        "--train-metrics-every",
+        type=int,
+        default=1,
+        help="Evaluate and log train-set metrics every N epochs. Use 0 to disable per-epoch train metrics.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--enable-tensorboard", action="store_true")
@@ -100,6 +131,78 @@ def resolve_device(value: str) -> torch.device:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
     return device
+
+
+def transform_targets(raw_targets: np.ndarray, transform: str) -> np.ndarray:
+    targets = np.asarray(raw_targets, dtype=np.float32)
+    if transform == "none":
+        return targets
+    if transform == "log1p":
+        if np.any(targets <= -1.0):
+            raise ValueError("log1p target transform requires all targets > -1.")
+        return np.log1p(targets).astype(np.float32)
+    raise ValueError(f"Unsupported target transform: {transform}")
+
+
+def inverse_transform_targets(transformed_targets: np.ndarray, transform: str) -> np.ndarray:
+    targets = np.asarray(transformed_targets, dtype=np.float32)
+    if transform == "none":
+        return targets
+    if transform == "log1p":
+        return np.expm1(targets).astype(np.float32)
+    raise ValueError(f"Unsupported target transform: {transform}")
+
+
+class WeightedRegressionLoss(nn.Module):
+    def __init__(
+        self,
+        *,
+        loss_name: str,
+        huber_beta: float,
+        strength_weight: float,
+        toughness_weight: float,
+    ) -> None:
+        super().__init__()
+        if strength_weight < 0 or toughness_weight < 0:
+            raise ValueError("Target loss weights must be >= 0.")
+        if strength_weight + toughness_weight <= 0:
+            raise ValueError("At least one target loss weight must be > 0.")
+        if loss_name == "mse":
+            self.base_loss = nn.MSELoss(reduction="none")
+        elif loss_name == "huber":
+            if float(huber_beta) <= 0:
+                raise ValueError("--huber-beta must be > 0.")
+            self.base_loss = nn.SmoothL1Loss(beta=float(huber_beta), reduction="none")
+        else:
+            raise ValueError(f"Unsupported loss: {loss_name}")
+        weights = torch.tensor([strength_weight, toughness_weight], dtype=torch.float32)
+        self.register_buffer("weights", weights)
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        loss = self.base_loss(predictions, targets)
+        if loss.ndim != 2 or loss.shape[-1] != 2:
+            raise ValueError(f"Expected per-target loss with shape (batch, 2), got {tuple(loss.shape)}.")
+        weights = self.weights.to(device=loss.device, dtype=loss.dtype)
+        weighted_loss = loss * weights
+        return weighted_loss.sum() / (loss.shape[0] * weights.sum())
+
+
+def build_loss(args: argparse.Namespace) -> nn.Module:
+    if args.loss == "mse":
+        return WeightedRegressionLoss(
+            loss_name=args.loss,
+            huber_beta=float(args.huber_beta),
+            strength_weight=float(args.strength_loss_weight),
+            toughness_weight=float(args.toughness_loss_weight),
+        )
+    if args.loss == "huber":
+        return WeightedRegressionLoss(
+            loss_name=args.loss,
+            huber_beta=float(args.huber_beta),
+            strength_weight=float(args.strength_loss_weight),
+            toughness_weight=float(args.toughness_loss_weight),
+        )
+    raise ValueError(f"Unsupported loss: {args.loss}")
 
 
 def make_dataset(
@@ -148,6 +251,7 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
     normalizer: TargetNormalizer,
+    target_transform: str,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     model.eval()
     total_loss = 0.0
@@ -167,8 +271,10 @@ def evaluate(
 
     pred_norm = np.concatenate(predictions, axis=0)
     true_norm = np.concatenate(targets, axis=0)
-    pred_raw = normalizer.inverse_transform(pred_norm)
-    true_raw = normalizer.inverse_transform(true_norm)
+    pred_transformed = normalizer.inverse_transform(pred_norm)
+    true_transformed = normalizer.inverse_transform(true_norm)
+    pred_raw = inverse_transform_targets(pred_transformed, target_transform)
+    true_raw = inverse_transform_targets(true_transformed, target_transform)
     return total_loss / max(1, total_count), true_raw, pred_raw
 
 
@@ -216,8 +322,9 @@ def main() -> None:
     )
 
     raw_targets = np.stack([record.targets for record in records]).astype(np.float32)
-    normalizer = TargetNormalizer.fit(raw_targets[split["train"]])
-    normalized_targets = normalizer.transform(raw_targets)
+    transformed_targets = transform_targets(raw_targets, args.target_transform)
+    normalizer = TargetNormalizer.fit(transformed_targets[split["train"]])
+    normalized_targets = normalizer.transform(transformed_targets)
 
     train_dataset = make_dataset(embeddings, normalized_targets, records, split["train"])
     val_dataset = make_dataset(embeddings, normalized_targets, records, split["val"])
@@ -227,6 +334,12 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+    )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
     )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -239,7 +352,7 @@ def main() -> None:
     )
     model = MechanicalPropertyMLP(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    criterion = nn.MSELoss()
+    criterion = build_loss(args)
     logger = PredictorLogger(args.output_dir, enable_tensorboard=args.enable_tensorboard)
     logger.write_split_indices(split)
 
@@ -247,6 +360,11 @@ def main() -> None:
         "args": vars(args),
         "model_config": config.to_dict(),
         "target_normalizer": normalizer.to_dict(),
+        "target_transform": args.target_transform,
+        "loss": args.loss,
+        "huber_beta": args.huber_beta,
+        "strength_loss_weight": args.strength_loss_weight,
+        "toughness_loss_weight": args.toughness_loss_weight,
         "split_sizes": {name: len(indices) for name, indices in split.items()},
     }
     (Path(args.output_dir) / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
@@ -265,19 +383,36 @@ def main() -> None:
             criterion=criterion,
             device=device,
         )
+        train_metrics = {}
+        if args.train_metrics_every > 0 and epoch % args.train_metrics_every == 0:
+            train_eval_loss, y_train_true, y_train_pred = evaluate(
+                model,
+                train_eval_loader,
+                criterion=criterion,
+                device=device,
+                normalizer=normalizer,
+                target_transform=args.target_transform,
+            )
+            train_metrics = compute_metrics(y_train_true, y_train_pred)
+            train_metrics["eval_loss"] = float(train_eval_loss)
         val_loss, y_val_true, y_val_pred = evaluate(
             model,
             val_loader,
             criterion=criterion,
             device=device,
             normalizer=normalizer,
+            target_transform=args.target_transform,
         )
         val_metrics = compute_metrics(y_val_true, y_val_pred)
+        epoch_metrics = {
+            **{f"train/{key}": value for key, value in train_metrics.items()},
+            **{f"val/{key}": value for key, value in val_metrics.items()},
+        }
         logger.log_epoch(
             epoch=epoch,
             train_loss=train_loss,
             val_loss=val_loss,
-            metrics={f"val/{key}": value for key, value in val_metrics.items()},
+            metrics=epoch_metrics,
             learning_rate=optimizer.param_groups[0]["lr"],
         )
         LOGGER.info(
@@ -286,7 +421,7 @@ def main() -> None:
             args.epochs,
             train_loss,
             val_loss,
-            format_metrics({f"val/{key}": value for key, value in val_metrics.items()}),
+            format_metrics(epoch_metrics),
         )
 
         checkpoint = {
@@ -295,8 +430,14 @@ def main() -> None:
             "optimizer_state_dict": optimizer.state_dict(),
             "model_config": config.to_dict(),
             "target_normalizer": normalizer.to_dict(),
+            "target_transform": args.target_transform,
+            "loss": args.loss,
+            "huber_beta": args.huber_beta,
+            "strength_loss_weight": args.strength_loss_weight,
+            "toughness_loss_weight": args.toughness_loss_weight,
             "args": vars(args),
             "val_loss": val_loss,
+            "train_metrics": train_metrics,
             "val_metrics": val_metrics,
         }
         torch.save(checkpoint, last_path)
@@ -326,6 +467,7 @@ def main() -> None:
             criterion=criterion,
             device=device,
             normalizer=normalizer,
+            target_transform=args.target_transform,
         )
         metrics = compute_metrics(y_true, y_pred)
         metrics["loss"] = float(loss)
@@ -351,6 +493,11 @@ def main() -> None:
         "best_val_loss": best_val_loss,
         "split_metrics": split_metrics,
         "target_normalizer": normalizer.to_dict(),
+        "target_transform": args.target_transform,
+        "loss": args.loss,
+        "huber_beta": args.huber_beta,
+        "strength_loss_weight": args.strength_loss_weight,
+        "toughness_loss_weight": args.toughness_loss_weight,
     }
     logger.write_final_metrics(final_payload)
     logger.plot_history()
