@@ -63,7 +63,7 @@ v127 range: 122.97..1499.5
 v128 range: 266.2141..11108.0789
 ```
 
-`v128` has a long tail, so RMSE can be dominated by extreme high-strength samples. The training code standardizes targets using train-set mean and standard deviation.
+`v128` has a long tail, so RMSE can be dominated by extreme high-strength samples. By default, the training code applies `log1p` to both targets, standardizes the transformed targets using train-set mean and standard deviation, and trains with weighted Huber loss in the normalized transformed target space. Reported metrics and prediction CSV files are inverse-transformed back to the original `v127`/`v128` scale.
 
 ## Directory Structure
 
@@ -207,6 +207,11 @@ python model/reward_module/mechanical-properties-predictor/train.py \
   --epochs 100 \
   --batch-size 64 \
   --learning-rate 1e-4 \
+  --target-transform log1p \
+  --loss huber \
+  --huber-beta 1.0 \
+  --strength-loss-weight 1.0 \
+  --toughness-loss-weight 1.0 \
   --enable-tensorboard
 ```
 
@@ -225,6 +230,11 @@ python model/reward_module/mechanical-properties-predictor/train.py \
   --epochs 100 \
   --batch-size 64 \
   --learning-rate 1e-4 \
+  --target-transform log1p \
+  --loss huber \
+  --huber-beta 1.0 \
+  --strength-loss-weight 1.0 \
+  --toughness-loss-weight 1.0 \
   --enable-tensorboard
 ```
 
@@ -298,6 +308,11 @@ Embeddings are pooled by mean over residue tokens and cached as `.npy` files by 
 --batch-size 64
 --learning-rate 1e-4
 --weight-decay 1e-4
+--target-transform log1p
+--loss huber
+--huber-beta 1.0
+--strength-loss-weight 1.0
+--toughness-loss-weight 1.0
 --patience 20
 --device auto
 ```
@@ -345,7 +360,7 @@ tensorboard/
 
 ## Model Selection
 
-The current checkpoint selection criterion is validation MSE on standardized targets.
+The current checkpoint selection criterion is validation loss in the normalized transformed target space. With the default settings this is weighted Huber loss after `log1p` target transform and train-set standardization. The target order is `strength, toughness`, so `--strength-loss-weight` controls the first output head and `--toughness-loss-weight` controls the second output head.
 
 Recommended model-quality checks:
 
