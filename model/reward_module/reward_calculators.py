@@ -36,6 +36,25 @@ import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
+try:
+    from .terminal_reward import (
+        DualStructureTerminalRewardResult,
+        HbondFeatureExtractor,
+        HbondFeatureResult,
+        HbondTopologyTerminalRewardCalculator,
+        StructureRewardResult,
+        TerminalRewardScalarization,
+    )
+except ImportError:  # pragma: no cover - supports direct script execution.
+    from terminal_reward import (  # type: ignore
+        DualStructureTerminalRewardResult,
+        HbondFeatureExtractor,
+        HbondFeatureResult,
+        HbondTopologyTerminalRewardCalculator,
+        StructureRewardResult,
+        TerminalRewardScalarization,
+    )
+
 # ---------------------------------------------------------------------------
 # Shared helper types
 # ---------------------------------------------------------------------------
@@ -909,8 +928,7 @@ class TerminalRewardCalculator:
             raise ValueError("Feature vector contains NaN or infinity.")
 
         batch = feature_array.reshape(1, -1)
-        # wait: change to a implemented predictor
-        prediction = np.array([0., 0.]) # self._run_predictor(batch)
+        prediction = self._run_predictor(batch)
         coerced = self._coerce_prediction(prediction)
 
         if not all(np.isfinite(value) for value in coerced.values()):
