@@ -26,14 +26,10 @@ SELECTED_HBOND_FEATURES = (
 TARGET_COLUMNS = ("v127", "v128")
 
 REWARD_MODULE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_RANDOM_SPLIT_DIR = (
-    REWARD_MODULE_DIR
-    / "mechanical-properties-predictor"
-    / "outputs"
-    / "hbond_analysis"
-)
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_RANDOM_SPLIT_DIR = REPO_ROOT / "outputs" / "mechanical_property_predictor" / "hbond_analysis"
 DEFAULT_HBOND_TABLE_PATH = DEFAULT_RANDOM_SPLIT_DIR / "hbond_length_disentanglement_table.csv"
-DEFAULT_ARTIFACT_PATH = Path(__file__).resolve().parent / "artifacts" / "hbond_random_forest.joblib"
+DEFAULT_ARTIFACT_PATH = REPO_ROOT / "params" / "hbond_random_forest.joblib"
 
 
 @dataclass(frozen=True)
@@ -62,7 +58,18 @@ def load_or_train_random_forest_artifact(
 ) -> HbondRandomForestArtifact:
     artifact_path = Path(artifact_path)
     if artifact_path.exists() and not force_retrain:
-        return joblib.load(artifact_path)
+        try:
+            return joblib.load(artifact_path)
+        except Exception as exc:
+            if _looks_like_git_lfs_pointer(artifact_path):
+                if not Path(table_path).exists():
+                    raise RuntimeError(
+                        f"{artifact_path} is a Git LFS pointer, but {table_path} is missing. "
+                        "Run `git lfs pull` or restore the hbond analysis table before loading "
+                        "the terminal reward model."
+                    ) from exc
+            else:
+                raise
 
     artifact = train_random_split_random_forest(table_path=table_path, split_dir=split_dir)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,3 +184,13 @@ def _fallback_random_ids(pdb_ids: Sequence[str]) -> tuple[set[str], set[str], se
     val = set(ids[n_test : n_test + n_val])
     train = set(ids[n_test + n_val :])
     return train, val, test
+
+
+def _looks_like_git_lfs_pointer(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size > 1024:
+        return False
+    try:
+        head = path.read_text(encoding="utf-8", errors="ignore")[:256]
+    except OSError:
+        return False
+    return head.startswith("version https://git-lfs.github.com/spec/")
