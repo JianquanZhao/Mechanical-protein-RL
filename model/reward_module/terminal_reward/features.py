@@ -10,6 +10,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from scipy.spatial import cKDTree
+except Exception:  # pragma: no cover - optional speed path
+    cKDTree = None
+
 
 CANONICAL_RESIDUES = {
     "ALA",
@@ -224,6 +229,67 @@ class HbondFeatureExtractor:
         donors = [atom for atom in atoms if atom.element in DONOR_ELEMENTS]
         acceptors = [atom for atom in atoms if atom.element in ACCEPTOR_ELEMENTS]
 
+        if cKDTree is None:
+            return self._find_hbonds_without_spatial_index(hydrogens, donors, acceptors)
+
+        hydrogens_by_residue: Dict[Tuple[str, int, str], List[ParsedAtom]] = {}
+        for hydrogen in hydrogens:
+            hydrogens_by_residue.setdefault(hydrogen.residue_key, []).append(hydrogen)
+
+        donor_hydrogen_pairs: List[Tuple[ParsedAtom, ParsedAtom]] = []
+        for donor in donors:
+            for hydrogen in hydrogens_by_residue.get(donor.residue_key, []):
+                if self._distance(donor.coord, hydrogen.coord) <= self.donor_hydrogen_distance_cutoff:
+                    donor_hydrogen_pairs.append((donor, hydrogen))
+
+        if not donor_hydrogen_pairs or not acceptors:
+            return []
+
+        acceptor_coords = np.asarray([acceptor.coord for acceptor in acceptors], dtype=float)
+        acceptor_tree = cKDTree(acceptor_coords)
+
+        hbonds: List[HbondRecord] = []
+        seen = set()
+        for donor, hydrogen in donor_hydrogen_pairs:
+            candidate_indices = acceptor_tree.query_ball_point(
+                hydrogen.coord,
+                r=self.hydrogen_acceptor_distance_cutoff,
+            )
+            for acceptor_index in candidate_indices:
+                acceptor = acceptors[acceptor_index]
+                if acceptor.atom_index == donor.atom_index:
+                    continue
+                donor_acceptor_distance = self._distance(donor.coord, acceptor.coord)
+                if donor_acceptor_distance > self.donor_acceptor_distance_cutoff:
+                    continue
+                hydrogen_acceptor_distance = self._distance(hydrogen.coord, acceptor.coord)
+                if hydrogen_acceptor_distance > self.hydrogen_acceptor_distance_cutoff:
+                    continue
+                angle = self._angle(donor.coord, hydrogen.coord, acceptor.coord)
+                if angle < self.angle_cutoff:
+                    continue
+                key = (donor.atom_index, hydrogen.atom_index, acceptor.atom_index)
+                if key in seen:
+                    continue
+                seen.add(key)
+                hbonds.append(
+                    HbondRecord(
+                        donor_atom=donor,
+                        hydrogen_atom=hydrogen,
+                        acceptor_atom=acceptor,
+                        donor_acceptor_distance=float(donor_acceptor_distance),
+                        hydrogen_acceptor_distance=float(hydrogen_acceptor_distance),
+                        donor_hydrogen_acceptor_angle=float(angle),
+                    )
+                )
+        return hbonds
+
+    def _find_hbonds_without_spatial_index(
+        self,
+        hydrogens: Sequence[ParsedAtom],
+        donors: Sequence[ParsedAtom],
+        acceptors: Sequence[ParsedAtom],
+    ) -> List[HbondRecord]:
         donor_hydrogen_pairs: List[Tuple[ParsedAtom, ParsedAtom]] = []
         for donor in donors:
             for hydrogen in hydrogens:
