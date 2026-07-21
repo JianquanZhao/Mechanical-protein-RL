@@ -370,6 +370,66 @@ class PyRosettaPoseBackend:
             return line
         return f"{line[:6]}{atom_serial:5d}{line[11:]}"
 
+    @staticmethod
+    def _infer_pdb_element(atom_name: str, raw_element: str = "") -> str:
+        raw = "".join(char for char in raw_element.strip().upper() if char.isalpha())
+        if raw and raw not in {"X", "XP", "PDB"}:
+            return raw[:2].rjust(2)
+
+        stripped = atom_name.strip()
+        if not stripped:
+            return "  "
+        stripped = stripped.lstrip("0123456789").upper()
+        if not stripped:
+            return "  "
+        # In protein PDB atom names, CA/CB/CD are usually carbon atom names,
+        # not calcium/cadmium element symbols. The first alphabetic character is
+        # therefore the most robust fallback for AlphaFold/CATH-style files with
+        # malformed element columns.
+        return stripped[0].rjust(2)
+
+    @staticmethod
+    def _safe_float(text: str, default: float) -> float:
+        try:
+            return float(text.strip())
+        except ValueError:
+            return float(default)
+
+    @staticmethod
+    def _safe_int(text: str, default: int) -> int:
+        try:
+            return int(text.strip())
+        except ValueError:
+            return int(default)
+
+    @classmethod
+    def _format_clean_atom_line(cls, line: str, atom_serial: int) -> str:
+        atom_name = line[12:16].strip()
+        altloc = line[16:17] if len(line) > 16 else " "
+        if altloc.strip() and altloc not in {"A", "1"}:
+            altloc = " "
+        residue_name = line[17:20].strip().upper()
+        chain_id = line[21:22].strip() or "A"
+        residue_seq = line[22:26].strip() or "1"
+        insertion_code = line[26:27].strip() if len(line) > 26 else ""
+        insertion_code = insertion_code[:1] if insertion_code else " "
+        x = cls._safe_float(line[30:38], 0.0)
+        y = cls._safe_float(line[38:46], 0.0)
+        z = cls._safe_float(line[46:54], 0.0)
+        occupancy = cls._safe_float(line[54:60], 1.0)
+        if occupancy <= 0.0:
+            occupancy = 1.0
+        bfactor = cls._safe_float(line[60:66], 0.0)
+        element = cls._infer_pdb_element(atom_name, line[76:78] if len(line) >= 78 else "")
+        atom_field = atom_name[:4]
+        residue_seq_int = cls._safe_int(residue_seq, atom_serial)
+        return (
+            f"ATOM  {atom_serial:5d} {atom_field:^4s}{altloc:1s}{residue_name:>3s} "
+            f"{chain_id[:1]:1s}{residue_seq_int:4d}{insertion_code:1s}   "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}{occupancy:6.2f}{bfactor:6.2f}"
+            f"          {element:>2s}  \n"
+        )
+
     def _clean_pdb_for_rosetta(self, path: Path) -> PDBCleaningResult:
         header_lines: List[str] = []
         residue_order: List[Tuple[str, str, str]] = []
@@ -380,7 +440,7 @@ class PyRosettaPoseBackend:
         with path.open("r", encoding="utf-8", errors="ignore") as file:
             for line in file:
                 record = line[:6].strip().upper()
-                if record == "ATOM":
+                if record in {"ATOM", "HETATM"}:
                     key = self._pdb_residue_key(line)
                     if key not in residue_lines:
                         residue_order.append(key)
@@ -389,7 +449,7 @@ class PyRosettaPoseBackend:
                         residue_names[key] = line[17:20].strip().upper()
                     residue_lines[key].append(line if line.endswith("\n") else f"{line}\n")
                     residue_atoms[key].add(line[12:16].strip().upper())
-                elif record in {"HEADER", "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA", "AUTHOR", "REMARK"}:
+                elif record in {"HEADER", "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA", "AUTHOR", "REMARK", "CRYST1"}:
                     header_lines.append(line if line.endswith("\n") else f"{line}\n")
 
         kept_keys: List[Tuple[str, str, str]] = []
@@ -422,17 +482,6 @@ class PyRosettaPoseBackend:
                 f"kept_residues={len(kept_keys)} skipped_missing_backbone={skipped_missing_backbone}."
             )
 
-        if skipped_noncanonical == 0 and skipped_missing_backbone == 0:
-            return PDBCleaningResult(
-                original_path=path,
-                load_path=path,
-                cleaned_path=None,
-                total_residues=len(residue_order),
-                kept_residues=len(kept_keys),
-                skipped_noncanonical_residues=0,
-                skipped_missing_backbone_residues=0,
-            )
-
         cleaned_lines: List[str] = []
         cleaned_lines.extend(header_lines)
         atom_serial = 1
@@ -442,7 +491,7 @@ class PyRosettaPoseBackend:
             if previous_chain is not None and chain_id != previous_chain:
                 cleaned_lines.append("TER\n")
             for line in residue_lines[key]:
-                cleaned_lines.append(self._renumber_atom_line(line, atom_serial))
+                cleaned_lines.append(self._format_clean_atom_line(line, atom_serial))
                 atom_serial += 1
             previous_chain = chain_id
         cleaned_lines.append("TER\n")
@@ -469,7 +518,7 @@ class PyRosettaPoseBackend:
             handle.writelines(cleaned_lines)
         cleaned_path = Path(handle.name).resolve()
         LOGGER.warning(
-            "Cleaned PDB before PyRosetta load source=%s cleaned=%s total_residues=%s "
+            "Cleaned/normalized PDB before PyRosetta load source=%s cleaned=%s total_residues=%s "
             "kept_residues=%s skipped_noncanonical=%s skipped_missing_backbone=%s "
             "missing_backbone_fraction=%.4f",
             path,
@@ -1340,7 +1389,13 @@ class MechanicalProteinEnv(_GymEnvBase):
 
         started = time.perf_counter()
         LOGGER.info("Evaluating terminal reward")
-        result = self.terminal_reward_calculator.evaluate_pose(self.current_pose)
+        if hasattr(self.terminal_reward_calculator, "evaluate_episode"):
+            result = self.terminal_reward_calculator.evaluate_episode(
+                relaxed_pose=self.current_pose,
+                source_pdb_path=self.initial_pdb_path,
+            )
+        else:
+            result = self.terminal_reward_calculator.evaluate_pose(self.current_pose)
         reward = self.terminal_reward_scale * float(result.reward)
         LOGGER.info(
             "Terminal reward evaluated raw_reward=%.6f scaled_reward=%.6f elapsed_sec=%.3f metrics=%s",

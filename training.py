@@ -163,6 +163,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rmsd-missing-penalty", type=float, default=5.0)
     parser.add_argument("--min-rmsd-atoms", type=int, default=3)
     parser.add_argument(
+        "--step-reward-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied after bounded 0-1 step reward normalization.",
+    )
+    parser.add_argument(
+        "--terminal-reward-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to the structure-based terminal reward.",
+    )
+    parser.add_argument(
+        "--no-terminal-reward",
+        action="store_true",
+        help="Disable the hbond-topology mechanical-property terminal reward.",
+    )
+    parser.add_argument(
+        "--terminal-reward-artifact",
+        default="params/hbond_random_forest.joblib",
+        help="Path to the hbond random-forest artifact used by terminal reward.",
+    )
+    parser.add_argument(
+        "--terminal-predicted-pdb-dir",
+        default=None,
+        help=(
+            "Optional directory containing sequence-predicted PDBs. When a matching "
+            "PDB is found, terminal reward averages PyRosetta terminal pose and "
+            "predicted structure 1:1."
+        ),
+    )
+    parser.add_argument(
         "--observation-encoder",
         choices=("default", "esm2"),
         default="default",
@@ -172,6 +203,14 @@ def parse_args() -> argparse.Namespace:
         "--esm2-device",
         default="auto",
         help="Device for ESM2 observation encoding when --observation-encoder esm2.",
+    )
+    parser.add_argument(
+        "--esm-model-dir",
+        default=None,
+        help=(
+            "Optional directory containing local fair-esm checkpoints. "
+            "For embedding_dim=1280 it should contain esm2_t33_650M_UR50D.pt."
+        ),
     )
     parser.add_argument(
         "--esm2-mutable-only",
@@ -303,11 +342,33 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
             embedding_dim=args.embedding_dim,
             device=args.esm2_device,
             mutable_only=args.esm2_mutable_only,
+            model_dir=args.esm_model_dir,
         )
+
+    terminal_reward_calculator = None
+    if not args.no_terminal_reward:
+        from model.reward_module.terminal_reward import (
+            EqualWeightDualStructureTerminalRewardCalculator,
+        )
+
+        terminal_reward_calculator = EqualWeightDualStructureTerminalRewardCalculator(
+            artifact_path=args.terminal_reward_artifact,
+            predicted_pdb_dir=args.terminal_predicted_pdb_dir,
+        )
+        LOGGER.info(
+            "Enabled hbond topology terminal reward artifact=%s predicted_pdb_dir=%s "
+            "structure_weights=pyrosetta_terminal:1,predicted_structure:1 "
+            "objective_weights=strength:1,toughness:1",
+            args.terminal_reward_artifact,
+            args.terminal_predicted_pdb_dir,
+        )
+    else:
+        LOGGER.info("Terminal reward disabled by --no-terminal-reward")
 
     LOGGER.info(
         "Building MechanicalProteinEnv max_steps=%s mutable_positions=%s "
-        "repack=%s minimize=%s minimize_backbone=%s local_repack_radius=%s observation_encoder=%s",
+        "repack=%s minimize=%s minimize_backbone=%s local_repack_radius=%s observation_encoder=%s "
+        "step_reward_scale=%s terminal_reward_scale=%s",
         args.max_steps,
         args.mutable_positions or "all canonical residues",
         not args.no_repack,
@@ -315,6 +376,8 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         args.minimize_backbone,
         args.local_repack_radius,
         args.observation_encoder,
+        args.step_reward_scale,
+        args.terminal_reward_scale,
     )
     return MechanicalProteinEnv(
         max_steps=args.max_steps,
@@ -328,6 +391,9 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         minimize_backbone=args.minimize_backbone,
         prevent_revisit_positions=args.prevent_revisit_positions,
         raise_on_update_error=args.raise_on_update_error,
+        step_reward_scale=args.step_reward_scale,
+        terminal_reward_scale=args.terminal_reward_scale,
+        terminal_reward_calculator=terminal_reward_calculator,
         observation_encoder=observation_encoder,
         step_reward_kwargs={
             "rmsd_missing_atom_policy": args.rmsd_missing_atom_policy,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -127,11 +127,14 @@ class HbondTopologyTerminalRewardCalculator:
             "strength": self.scalarization.strength_weight * float(normalized_strength),
             "toughness": self.scalarization.toughness_weight * float(normalized_toughness),
         }
+        total_weight = self.scalarization.strength_weight + self.scalarization.toughness_weight
+        if total_weight <= 0.0:
+            raise ValueError("At least one terminal objective weight must be positive.")
         diagnostics = feature_result.to_dict()
         diagnostics.pop("features", None)
 
         return StructureRewardResult(
-            reward=float(sum(components.values())),
+            reward=float(sum(components.values()) / total_weight),
             strength=strength,
             toughness=toughness,
             normalized_strength=float(normalized_strength),
@@ -224,3 +227,115 @@ class HbondTopologyTerminalRewardCalculator:
         if value is None or not np.isfinite(value):
             return None
         return float(max(0.0, min(1.0, value)))
+
+
+class EqualWeightDualStructureTerminalRewardCalculator:
+    """
+    Terminal reward wrapper for the RL base version.
+
+    The wrapper scores the PyRosetta terminal Pose and, when available, a
+    matching sequence-predicted PDB. If both structures are available, their
+    terminal rewards are averaged 1:1. If a matching predicted structure is not
+    available, the relaxed PyRosetta Pose is used alone and the missing predicted
+    path is recorded in the returned diagnostics.
+    """
+
+    def __init__(
+        self,
+        *,
+        artifact_path: str | Path = DEFAULT_ARTIFACT_PATH,
+        predicted_pdb_dir: Optional[str | Path] = None,
+        predicted_pdb_patterns: Sequence[str] = (
+            "{stem}.pdb",
+            "{stem}_relaxed_rank_001_alphafold2_ptm_model_1_seed_000.pdb",
+            "{stem}*relaxed_rank_001*.pdb",
+            "{stem}*unrelaxed_rank_001*.pdb",
+        ),
+        force_retrain_artifact: bool = False,
+    ) -> None:
+        self.predicted_pdb_dir = None if predicted_pdb_dir is None else Path(predicted_pdb_dir).expanduser()
+        self.predicted_pdb_patterns = tuple(predicted_pdb_patterns)
+        self.base_calculator = HbondTopologyTerminalRewardCalculator(
+            artifact_path=artifact_path,
+            scalarization=TerminalRewardScalarization(
+                strength_weight=1.0,
+                toughness_weight=1.0,
+                disagreement_penalty=0.0,
+                use_zscore=True,
+            ),
+            force_retrain_artifact=force_retrain_artifact,
+        )
+
+    def evaluate_pose(self, pose: Any) -> StructureRewardResult:
+        """Fallback API used when no source PDB context is available."""
+
+        return self.base_calculator.evaluate_pose(pose)
+
+    def evaluate_episode(
+        self,
+        *,
+        relaxed_pose: Any,
+        source_pdb_path: Optional[str | Path] = None,
+    ) -> DualStructureTerminalRewardResult:
+        predicted_pdb_path = self.resolve_predicted_pdb_path(source_pdb_path)
+        relaxed_result = self.base_calculator.evaluate_pose(relaxed_pose)
+        predicted_result = (
+            self.base_calculator.evaluate_pdb(predicted_pdb_path)
+            if predicted_pdb_path is not None
+            else None
+        )
+
+        if predicted_result is None:
+            return DualStructureTerminalRewardResult(
+                reward=float(relaxed_result.reward),
+                relaxed_result=relaxed_result,
+                predicted_result=None,
+                relaxed_weight=1.0,
+                predicted_weight=0.0,
+                weighted_reward=float(relaxed_result.reward),
+                disagreement_penalty=0.0,
+                reward_components={
+                    "relaxed_structure_reward": float(relaxed_result.reward),
+                    "predicted_structure_reward": 0.0,
+                    "relaxed_structure_weight": 1.0,
+                    "predicted_structure_weight": 0.0,
+                    "predicted_structure_missing": 1.0,
+                },
+            )
+
+        weighted_reward = 0.5 * float(relaxed_result.reward) + 0.5 * float(predicted_result.reward)
+        return DualStructureTerminalRewardResult(
+            reward=float(weighted_reward),
+            relaxed_result=relaxed_result,
+            predicted_result=predicted_result,
+            relaxed_weight=1.0,
+            predicted_weight=1.0,
+            weighted_reward=float(weighted_reward),
+            disagreement_penalty=0.0,
+            reward_components={
+                "relaxed_structure_reward": float(relaxed_result.reward),
+                "predicted_structure_reward": float(predicted_result.reward),
+                "relaxed_structure_weight": 1.0,
+                "predicted_structure_weight": 1.0,
+                "predicted_structure_missing": 0.0,
+            },
+        )
+
+    def resolve_predicted_pdb_path(self, source_pdb_path: Optional[str | Path]) -> Optional[Path]:
+        if self.predicted_pdb_dir is None or source_pdb_path is None:
+            return None
+        source = Path(source_pdb_path)
+        stem = source.stem
+        name = source.name
+        search_dirs = [self.predicted_pdb_dir]
+        results_dir = self.predicted_pdb_dir / "results"
+        if results_dir.is_dir():
+            search_dirs.append(results_dir)
+        for search_dir in search_dirs:
+            for pattern in self.predicted_pdb_patterns:
+                expanded = pattern.format(stem=stem, name=name)
+                matches = sorted(search_dir.glob(expanded))
+                for match in matches:
+                    if match.is_file():
+                        return match
+        return None

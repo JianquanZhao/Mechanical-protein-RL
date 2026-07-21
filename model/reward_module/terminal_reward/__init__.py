@@ -2,6 +2,7 @@
 
 from .calculator import (
     DualStructureTerminalRewardResult,
+    EqualWeightDualStructureTerminalRewardCalculator,
     HbondTopologyTerminalRewardCalculator,
     StructureRewardResult,
     TerminalRewardScalarization,
@@ -20,6 +21,7 @@ __all__ = [
     "DEFAULT_HBOND_TABLE_PATH",
     "DEFAULT_RANDOM_SPLIT_DIR",
     "DualStructureTerminalRewardResult",
+    "EqualWeightDualStructureTerminalRewardCalculator",
     "HbondFeatureExtractor",
     "HbondFeatureResult",
     "HbondTopologyTerminalRewardCalculator",

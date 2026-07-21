@@ -8,7 +8,9 @@ model through fair-esm.
 
 from __future__ import annotations
 
+import argparse
 import logging
+from pathlib import Path
 from typing import Any, Callable, Dict, Tuple
 
 import numpy as np
@@ -39,6 +41,10 @@ class ESM2SequenceEncoder:
         If true, encode env.current_sequence(mutable_only=True). This is the
         default because the DDQN action layout is aligned to mutable positions:
         one residue row corresponds to 20 amino-acid actions.
+    model_dir:
+        Optional directory containing local fair-esm checkpoints such as
+        esm2_t33_650M_UR50D.pt. When supplied, the encoder loads from disk and
+        avoids torch hub downloads.
     """
 
     def __init__(
@@ -47,6 +53,7 @@ class ESM2SequenceEncoder:
         embedding_dim: int = 1280,
         device: str = "auto",
         mutable_only: bool = True,
+        model_dir: str | Path | None = None,
     ) -> None:
         if int(embedding_dim) not in ESM2_MODEL_SPECS:
             raise ValueError(
@@ -68,13 +75,27 @@ class ESM2SequenceEncoder:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
         LOGGER.info(
-            "Loading ESM2 model name=%s embedding_dim=%s representation_layer=%s device=%s",
+            "Loading ESM2 model name=%s embedding_dim=%s representation_layer=%s device=%s model_dir=%s",
             model_name,
             embedding_dim,
             representation_layer,
             device,
+            model_dir,
         )
-        self.model, alphabet = model_loader()
+        if model_dir is None:
+            self.model, alphabet = model_loader()
+        else:
+            model_path = Path(model_dir).expanduser().resolve() / f"{model_name}.pt"
+            if not model_path.is_file():
+                raise FileNotFoundError(
+                    f"ESM2 local checkpoint not found: {model_path}. "
+                    "Either provide a directory containing the selected model "
+                    "or omit model_dir to use fair-esm's default loader."
+                )
+            LOGGER.info("Loading ESM2 local checkpoint path=%s", model_path)
+            if hasattr(torch.serialization, "add_safe_globals"):
+                torch.serialization.add_safe_globals([argparse.Namespace])
+            self.model, alphabet = esm.pretrained.load_model_and_alphabet_local(model_path)
         self.model.eval()
         self.model.to(torch.device(device))
 
@@ -83,6 +104,7 @@ class ESM2SequenceEncoder:
         self.representation_layer = int(representation_layer)
         self.device = torch.device(device)
         self.mutable_only = bool(mutable_only)
+        self.model_dir = None if model_dir is None else str(Path(model_dir).expanduser().resolve())
         LOGGER.info(
             "ESM2 encoder ready model=%s device=%s output=per_residue",
             model_name,
