@@ -40,6 +40,7 @@ PathLike = Union[str, Path]
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_PROTEIN_EMBEDDING_DIMS = (1280, 2560, 5120)
 AMINO_ACID_ACTION_DIM = 20
+SUPPORTED_AMP_DTYPES = ("float16", "bfloat16")
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,8 @@ class DDQNConfig:
 
     device: str = "auto"
     use_amp: bool = False
+    amp_dtype: str = "bfloat16"
+    amp_max_retries: int = 4
     seed: Optional[int] = None
 
     @property
@@ -107,6 +110,10 @@ class DDQNConfig:
             )
         if self.epsilon_decay_steps <= 0:
             raise ValueError("epsilon_decay_steps must be > 0.")
+        if self.amp_dtype not in SUPPORTED_AMP_DTYPES:
+            raise ValueError(f"amp_dtype must be one of {SUPPORTED_AMP_DTYPES}.")
+        if self.amp_max_retries < 0:
+            raise ValueError("amp_max_retries must be >= 0.")
 
 
 @dataclass(frozen=True)
@@ -123,6 +130,8 @@ class OptimizationResult:
     optimization_step: int
     target_synced: bool
     epsilon: float
+    amp_retries: int = 0
+    amp_scale: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -321,14 +330,32 @@ class DDQNAgent:
         )
 
         self.amp_enabled = bool(config.use_amp and self.device.type == "cuda")
-        self._grad_scaler = self._create_grad_scaler(self.amp_enabled)
+        self.amp_dtype = (
+            torch.bfloat16 if config.amp_dtype == "bfloat16" else torch.float16
+        )
+        if (
+            self.amp_enabled
+            and self.amp_dtype == torch.bfloat16
+            and not torch.cuda.is_bf16_supported()
+        ):
+            raise RuntimeError(
+                "bfloat16 AMP was requested, but the selected CUDA device does not "
+                "report bfloat16 support. Use --amp-dtype float16 or disable AMP."
+            )
+        self._grad_scaler_enabled = bool(
+            self.amp_enabled and self.amp_dtype == torch.float16
+        )
+        self._grad_scaler = self._create_grad_scaler(self._grad_scaler_enabled)
 
         self.environment_steps = 0
         self.optimization_steps = 0
         LOGGER.info(
-            "DDQNAgent ready device=%s amp_enabled=%s effective_batch_size=%s elapsed_sec=%.3f",
+            "DDQNAgent ready device=%s amp_enabled=%s amp_dtype=%s "
+            "grad_scaler_enabled=%s effective_batch_size=%s elapsed_sec=%.3f",
             self.device,
             self.amp_enabled,
+            config.amp_dtype if self.amp_enabled else "disabled",
+            self._grad_scaler_enabled,
             self.config.effective_batch_size,
             time.perf_counter() - started,
         )
@@ -399,7 +426,7 @@ class DDQNAgent:
         if not evaluate and advance_step:
             self.environment_steps += 1
 
-        LOGGER.info(
+        LOGGER.debug(
             "DDQNAgent selected action=%s mode=%s evaluate=%s epsilon=%.6f "
             "valid_actions=%s environment_steps=%s",
             action,
@@ -514,14 +541,14 @@ class DDQNAgent:
             self.config.effective_batch_size,
         )
         if len(replay_buffer) < required_size:
-            LOGGER.info(
+            LOGGER.debug(
                 "DDQN optimization waiting for replay warmup buffer_size=%s required_size=%s",
                 len(replay_buffer),
                 required_size,
             )
             return None
 
-        LOGGER.info(
+        LOGGER.debug(
             "DDQN sampling replay batch batch_size=%s buffer_size=%s",
             self.config.effective_batch_size,
             len(replay_buffer),
@@ -536,13 +563,31 @@ class DDQNAgent:
 
         optimize_started = time.perf_counter()
         arrays = self._coerce_replay_batch(batch)
+        return self._optimize_arrays(
+            arrays,
+            optimize_started=optimize_started,
+            amp_retry=0,
+        )
+
+    def _optimize_arrays(
+        self,
+        arrays: Mapping[str, Any],
+        *,
+        optimize_started: float,
+        amp_retry: int,
+    ) -> OptimizationResult:
+        """Run one optimizer attempt, retrying recoverable FP16 overflows."""
+
         total_size = int(arrays["actions"].shape[0])
-        LOGGER.info(
-            "DDQN optimize_batch started total_size=%s micro_batch_size=%s device=%s amp=%s",
+        LOGGER.debug(
+            "DDQN optimize_batch started total_size=%s micro_batch_size=%s "
+            "device=%s amp=%s amp_dtype=%s amp_retry=%s",
             total_size,
             self.config.micro_batch_size,
             self.device,
             self.amp_enabled,
+            self.config.amp_dtype if self.amp_enabled else "disabled",
+            amp_retry,
         )
 
         self.online_network.train()
@@ -606,7 +651,7 @@ class DDQNAgent:
                 )
                 scaled_loss = loss_sum / total_size
 
-            if self.amp_enabled:
+            if self._grad_scaler_enabled:
                 self._grad_scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
@@ -624,7 +669,23 @@ class DDQNAgent:
                 time.perf_counter() - micro_started,
             )
 
-        if self.amp_enabled:
+        forward_metrics = np.asarray(
+            [
+                total_loss_sum,
+                total_q_sum,
+                total_target_sum,
+                total_absolute_td_error_sum,
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(forward_metrics)):
+            self.optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(
+                "DDQN forward or TD metrics contain NaN or infinity before the "
+                "optimizer step. Inspect rewards, Q values, and observations."
+            )
+
+        if self._grad_scaler_enabled:
             self._grad_scaler.unscale_(self.optimizer)
 
         if self.config.max_grad_norm is None:
@@ -638,18 +699,39 @@ class DDQNAgent:
 
         if not np.isfinite(grad_norm):
             self.optimizer.zero_grad(set_to_none=True)
+            if (
+                self._grad_scaler_enabled
+                and amp_retry < self.config.amp_max_retries
+            ):
+                previous_scale = float(self._grad_scaler.get_scale())
+                self._grad_scaler.update()
+                reduced_scale = float(self._grad_scaler.get_scale())
+                if reduced_scale < previous_scale:
+                    LOGGER.warning(
+                        "DDQN FP16 gradient overflow detected; retrying batch "
+                        "amp_retry=%s/%s previous_scale=%.1f reduced_scale=%.1f",
+                        amp_retry + 1,
+                        self.config.amp_max_retries,
+                        previous_scale,
+                        reduced_scale,
+                    )
+                    return self._optimize_arrays(
+                        arrays,
+                        optimize_started=optimize_started,
+                        amp_retry=amp_retry + 1,
+                    )
             LOGGER.error("DDQN gradient norm is non-finite grad_norm=%s", grad_norm)
             raise FloatingPointError(
                 "Gradient norm is NaN or infinity. "
-                "Inspect rewards, Q values and learning rate."
+                "Inspect rewards, Q values, AMP dtype/scale, and learning rate."
             )
 
-        if self.amp_enabled:
+        if self._grad_scaler_enabled:
             self._grad_scaler.step(self.optimizer)
             self._grad_scaler.update()
         else:
             self.optimizer.step()
-        LOGGER.info("DDQN optimizer step applied grad_norm=%.8f", grad_norm)
+        LOGGER.debug("DDQN optimizer step applied grad_norm=%.8f", grad_norm)
 
         self.optimization_steps += 1
 
@@ -670,11 +752,17 @@ class DDQNAgent:
             optimization_step=self.optimization_steps,
             target_synced=target_synced,
             epsilon=self.epsilon,
+            amp_retries=amp_retry,
+            amp_scale=(
+                float(self._grad_scaler.get_scale())
+                if self._grad_scaler_enabled
+                else None
+            ),
         )
-        LOGGER.info(
+        LOGGER.debug(
             "DDQN optimize_batch complete optimization_step=%s loss=%.8f "
             "mean_q=%.8f mean_target=%.8f mean_abs_td=%.8f micro_batches=%s "
-            "target_synced=%s elapsed_sec=%.3f",
+            "target_synced=%s amp_retries=%s amp_scale=%s elapsed_sec=%.3f",
             result.optimization_step,
             result.loss,
             result.mean_q_value,
@@ -682,6 +770,8 @@ class DDQNAgent:
             result.mean_absolute_td_error,
             result.micro_batches,
             result.target_synced,
+            result.amp_retries,
+            result.amp_scale,
             time.perf_counter() - optimize_started,
         )
         return result
@@ -693,10 +783,10 @@ class DDQNAgent:
     def hard_sync_target_network(self) -> None:
         """Copy all online-network weights into the target network."""
 
-        LOGGER.info("DDQN hard target sync started")
+        LOGGER.debug("DDQN hard target sync started")
         self.target_network.load_state_dict(self.online_network.state_dict())
         self.target_network.eval()
-        LOGGER.info("DDQN hard target sync complete")
+        LOGGER.debug("DDQN hard target sync complete")
 
     def soft_sync_target_network(self, tau: float) -> None:
         """Polyak update: target <- tau * online + (1 - tau) * target."""
@@ -735,6 +825,8 @@ class DDQNAgent:
 
         if torch.cuda.is_available():
             payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+        if self._grad_scaler_enabled:
+            payload["grad_scaler"] = self._grad_scaler.state_dict()
 
         return payload
 
@@ -753,6 +845,8 @@ class DDQNAgent:
         self.target_network.eval()
         self.optimizer.load_state_dict(payload["optimizer"])
         self._move_optimizer_state_to_device()
+        if self._grad_scaler_enabled and "grad_scaler" in payload:
+            self._grad_scaler.load_state_dict(payload["grad_scaler"])
 
         self.environment_steps = int(payload["environment_steps"])
         self.optimization_steps = int(payload["optimization_steps"])
@@ -929,7 +1023,7 @@ class DDQNAgent:
     def _autocast_context(self):
         if not self.amp_enabled:
             return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return torch.autocast(device_type="cuda", dtype=self.amp_dtype)
 
     def _calculate_grad_norm(self) -> float:
         norms = [
