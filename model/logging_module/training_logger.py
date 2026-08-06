@@ -225,7 +225,7 @@ class TrainingLogger:
             )
         )
         self._tensorboard_add_scalars("optimization", record, tensorboard_step)
-        LOGGER.info(
+        LOGGER.debug(
             "Logged optimization record optimization_step=%s global_step=%s loss=%s path=%s",
             record.get("optimization_step"),
             record.get("global_step"),
@@ -321,7 +321,7 @@ class TrainingLogger:
                 record["global_step"],
             )
 
-        LOGGER.info(
+        LOGGER.debug(
             "Logged step record episode=%s episode_step=%s global_step=%s reward=%.6f "
             "done=%s path=%s",
             record["episode"],
@@ -388,7 +388,7 @@ class TrainingLogger:
         self.episode_records.append(record)
         self._append_jsonl(self.episodes_jsonl_path, record)
         self._write_episode_csv()
-        LOGGER.info(
+        LOGGER.debug(
             "Logged episode record episode=%s total_reward=%.6f steps=%s path=%s csv=%s",
             record["episode"],
             record["total_reward"],
@@ -865,7 +865,7 @@ class TrainingLogger:
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
             file.write("\n")
-        LOGGER.info("Appended JSONL path=%s keys=%s", path, sorted(record.keys()))
+        LOGGER.debug("Appended JSONL path=%s keys=%s", path, sorted(record.keys()))
 
     @staticmethod
     def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -935,7 +935,7 @@ class TrainingLogger:
             writer.writeheader()
             for record in self.episode_records:
                 writer.writerow(record)
-        LOGGER.info(
+        LOGGER.debug(
             "Wrote episode CSV path=%s rows=%s",
             self.episodes_csv_path,
             len(self.episode_records),

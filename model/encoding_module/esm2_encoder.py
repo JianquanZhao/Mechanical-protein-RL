@@ -120,7 +120,7 @@ class ESM2SequenceEncoder:
         _, _, tokens = self.batch_converter([("protein", sequence)])
         tokens = tokens.to(self.device)
 
-        LOGGER.info(
+        LOGGER.debug(
             "Encoding sequence with ESM2 length=%s embedding_dim=%s device=%s output=per_residue",
             len(sequence),
             self.embedding_dim,

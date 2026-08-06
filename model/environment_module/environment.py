@@ -310,7 +310,7 @@ class PyRosettaPoseBackend:
             raise FileNotFoundError(f"Initial PDB file does not exist: {path}")
         started = time.perf_counter()
         cleaning_result = self._prepare_pdb_for_load(path)
-        LOGGER.info(
+        LOGGER.debug(
             "Loading pose from PDB path=%s source_path=%s cleaned=%s kept_residues=%s "
             "skipped_noncanonical=%s skipped_missing_backbone=%s",
             cleaning_result.load_path,
@@ -338,7 +338,7 @@ class PyRosettaPoseBackend:
                 and cleaning_result.cleaned_path.exists()
             ):
                 cleaning_result.cleaned_path.unlink()
-        LOGGER.info(
+        LOGGER.debug(
             "Loaded pose path=%s source_path=%s residues=%s elapsed_sec=%.3f",
             cleaning_result.load_path,
             path,
@@ -578,7 +578,7 @@ class PyRosettaPoseBackend:
             neighborhood.append(center_position)
 
         result = tuple(sorted(set(neighborhood)))
-        LOGGER.info(
+        LOGGER.debug(
             "Computed local residues center=%s radius=%s count=%s elapsed_sec=%.3f",
             center_position,
             radius,
@@ -599,9 +599,9 @@ class PyRosettaPoseBackend:
         mover.set_target(int(position))
         mover.set_res_name(AA_ONE_TO_THREE[amino_acid])
         started = time.perf_counter()
-        LOGGER.info("Applying mutation position=%s amino_acid=%s", position, amino_acid)
+        LOGGER.debug("Applying mutation position=%s amino_acid=%s", position, amino_acid)
         mover.apply(pose)
-        LOGGER.info(
+        LOGGER.debug(
             "Applied mutation position=%s amino_acid=%s elapsed_sec=%.3f",
             position,
             amino_acid,
@@ -613,7 +613,7 @@ class PyRosettaPoseBackend:
         from pyrosetta.rosetta.protocols.minimization_packing import PackRotamersMover
 
         started = time.perf_counter()
-        LOGGER.info("Starting local repack local_residue_count=%s", len(local_residues))
+        LOGGER.debug("Starting local repack local_residue_count=%s", len(local_residues))
         allowed = {int(index) for index in local_residues}
         task = standard_packer_task(pose)
         task.restrict_to_repacking()
@@ -624,7 +624,7 @@ class PyRosettaPoseBackend:
 
         mover = PackRotamersMover(self.scorefxn, task)
         mover.apply(pose)
-        LOGGER.info(
+        LOGGER.debug(
             "Finished local repack local_residue_count=%s elapsed_sec=%.3f",
             len(local_residues),
             time.perf_counter() - started,
@@ -641,7 +641,7 @@ class PyRosettaPoseBackend:
         from pyrosetta.rosetta.protocols.minimization_packing import MinMover
 
         started = time.perf_counter()
-        LOGGER.info(
+        LOGGER.debug(
             "Starting local minimization local_residue_count=%s minimize_backbone=%s",
             len(local_residues),
             minimize_backbone,
@@ -662,7 +662,7 @@ class PyRosettaPoseBackend:
         mover.min_type(self.minimization_type)
         mover.tolerance(self.minimization_tolerance)
         mover.apply(pose)
-        LOGGER.info(
+        LOGGER.debug(
             "Finished local minimization local_residue_count=%s minimize_backbone=%s elapsed_sec=%.3f",
             len(local_residues),
             minimize_backbone,
@@ -673,9 +673,9 @@ class PyRosettaPoseBackend:
     def dump_pose(pose: Any, output_path: str) -> None:
         path = Path(output_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        LOGGER.info("Dumping pose to PDB path=%s", path)
+        LOGGER.debug("Dumping pose to PDB path=%s", path)
         pose.dump_pdb(str(path))
-        LOGGER.info("Dumped pose to PDB path=%s", path)
+        LOGGER.debug("Dumped pose to PDB path=%s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -912,7 +912,7 @@ class MechanicalProteinEnv(_GymEnvBase):
 
         load_started = time.perf_counter()
         self.initial_pdb_path = str(Path(pdb_path).expanduser())
-        LOGGER.info("Loading episode structure pdb_path=%s", self.initial_pdb_path)
+        LOGGER.debug("Loading episode structure pdb_path=%s", self.initial_pdb_path)
 
         loaded_pose = self.backend.load_pose(self.initial_pdb_path)
         self.reference_pose = self.backend.clone_pose(loaded_pose)
@@ -980,7 +980,7 @@ class MechanicalProteinEnv(_GymEnvBase):
             shape=initial_observation.shape,
             dtype=np.float32,
         )
-        LOGGER.info(
+        LOGGER.debug(
             "Episode structure loaded pdb_path=%s residues=%s mutable_positions=%s "
             "action_dim=%s observation_shape=%s elapsed_sec=%.3f",
             self.initial_pdb_path,
@@ -1172,7 +1172,7 @@ class MechanicalProteinEnv(_GymEnvBase):
                 )
             self._load_episode_structure(self.initial_pdb_path)
 
-        LOGGER.info("Environment reset started seed=%s pdb_path=%s", seed, self.initial_pdb_path)
+        LOGGER.debug("Environment reset started seed=%s pdb_path=%s", seed, self.initial_pdb_path)
         self.current_pose = self.backend.clone_pose(self.reference_pose)
         self.current_step = 0
         self.accepted_mutation_count = 0
@@ -1184,7 +1184,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         info = self._base_info()
         info["event"] = "reset"
         info["pdb_path"] = self.initial_pdb_path
-        LOGGER.info(
+        LOGGER.debug(
             "Environment reset complete pdb_path=%s valid_actions=%s sequence=%s mutable_sequence=%s",
             self.initial_pdb_path,
             info.get("valid_action_count"),
@@ -1201,7 +1201,7 @@ class MechanicalProteinEnv(_GymEnvBase):
 
         step_started = time.perf_counter()
         decoded = self.decode_action(action)
-        LOGGER.info(
+        LOGGER.debug(
             "Environment step started step_index=%s action=%s pose_position=%s target_amino_acid=%s",
             self.current_step + 1,
             action,
@@ -1217,7 +1217,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         if invalid_reason is not None:
             step_reward = self.invalid_action_penalty
             reason = invalid_reason
-            LOGGER.info(
+            LOGGER.warning(
                 "Environment action rejected action=%s reason=%s penalty=%.6f",
                 action,
                 reason,
@@ -1226,7 +1226,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         else:
             previous_pose = self.backend.clone_pose(self.current_pose)
             candidate_pose = self.backend.clone_pose(self.current_pose)
-            LOGGER.info(
+            LOGGER.debug(
                 "Environment candidate pose cloned for action=%s pose_position=%s",
                 action,
                 decoded.pose_position,
@@ -1261,7 +1261,7 @@ class MechanicalProteinEnv(_GymEnvBase):
                     local_residues=local_residues,
                 )
                 step_reward = self.step_reward_scale * float(step_reward_result.reward)
-                LOGGER.info(
+                LOGGER.debug(
                     "Step reward evaluated raw_reward=%.6f scaled_reward=%.6f metrics=%s",
                     float(step_reward_result.reward),
                     float(step_reward),
@@ -1285,7 +1285,7 @@ class MechanicalProteinEnv(_GymEnvBase):
                 self.visited_positions.add(decoded.pose_position)
                 self.accepted_mutation_count += 1
                 accepted = True
-                LOGGER.info(
+                LOGGER.debug(
                     "Environment mutation accepted pose_position=%s accepted_mutation_count=%s",
                     decoded.pose_position,
                     self.accepted_mutation_count,
@@ -1310,7 +1310,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         terminal_reward = 0.0
         terminal_reward_result: Optional[Any] = None
         if truncated:
-            LOGGER.info(
+            LOGGER.debug(
                 "Environment episode truncation detected reason=%s; finalizing terminal reward",
                 truncation_reason,
             )
@@ -1349,7 +1349,7 @@ class MechanicalProteinEnv(_GymEnvBase):
             )
         )
 
-        LOGGER.info(
+        LOGGER.debug(
             "Environment step complete step_index=%s total_reward=%.6f step_reward=%.6f "
             "terminal_reward=%.6f accepted=%s reason=%s terminated=%s truncated=%s "
             "valid_actions=%s elapsed_sec=%.3f",
@@ -1379,16 +1379,16 @@ class MechanicalProteinEnv(_GymEnvBase):
 
     def _finalize_episode(self) -> Tuple[float, Optional[Any]]:
         if self._episode_finalized:
-            LOGGER.info("Episode already finalized; terminal reward is not recalculated")
+            LOGGER.debug("Episode already finalized; terminal reward is not recalculated")
             return 0.0, None
 
         self._episode_finalized = True
         if self.terminal_reward_calculator is None:
-            LOGGER.info("No terminal_reward_calculator configured; terminal reward=0")
+            LOGGER.debug("No terminal_reward_calculator configured; terminal reward=0")
             return 0.0, None
 
         started = time.perf_counter()
-        LOGGER.info("Evaluating terminal reward")
+        LOGGER.debug("Evaluating terminal reward")
         if hasattr(self.terminal_reward_calculator, "evaluate_episode"):
             result = self.terminal_reward_calculator.evaluate_episode(
                 relaxed_pose=self.current_pose,
@@ -1398,10 +1398,13 @@ class MechanicalProteinEnv(_GymEnvBase):
             result = self.terminal_reward_calculator.evaluate_pose(self.current_pose)
         reward = self.terminal_reward_scale * float(result.reward)
         LOGGER.info(
-            "Terminal reward evaluated raw_reward=%.6f scaled_reward=%.6f elapsed_sec=%.3f metrics=%s",
+            "Terminal reward evaluated raw_reward=%.6f scaled_reward=%.6f elapsed_sec=%.3f",
             float(result.reward),
             reward,
             time.perf_counter() - started,
+        )
+        LOGGER.debug(
+            "Terminal reward details metrics=%s",
             self._result_to_dict(result),
         )
         return reward, result
@@ -1437,9 +1440,9 @@ class MechanicalProteinEnv(_GymEnvBase):
     def save_current_pose(self, output_path: str) -> None:
         """Write the current candidate structure to a PDB file."""
 
-        LOGGER.info("Saving current environment pose path=%s", output_path)
+        LOGGER.debug("Saving current environment pose path=%s", output_path)
         self.backend.dump_pose(self.current_pose, output_path)
-        LOGGER.info("Saved current environment pose path=%s", output_path)
+        LOGGER.debug("Saved current environment pose path=%s", output_path)
 
     def save_history(self, output_path: str) -> None:
         """Write the current episode transition log to JSON."""

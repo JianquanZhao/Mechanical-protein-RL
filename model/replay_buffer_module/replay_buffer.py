@@ -8,6 +8,7 @@ can invalidate actions such as mutating a residue to its current amino acid.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
@@ -225,7 +226,7 @@ class ReplayBuffer:
 
         self._position = (self._position + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
-        LOGGER.info(
+        LOGGER.debug(
             "ReplayBuffer added transition index=%s action=%s reward=%.6f "
             "terminated=%s truncated=%s done=%s size=%s next_position=%s",
             index,
@@ -250,7 +251,7 @@ class ReplayBuffer:
 
         indices = self._rng.choice(self._size, size=batch_size, replace=replace)
         indices = np.asarray(indices, dtype=np.int64)
-        LOGGER.info(
+        LOGGER.debug(
             "ReplayBuffer sampled batch_size=%s replace=%s size=%s indices_preview=%s",
             batch_size,
             replace,
@@ -379,6 +380,7 @@ class ReplayBuffer:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        started = time.perf_counter()
         LOGGER.info("ReplayBuffer save started path=%s size=%s capacity=%s", path, self._size, self.capacity)
         payload = self.state_dict()
         metadata = {
@@ -389,22 +391,35 @@ class ReplayBuffer:
                 "variable_length", "position", "size", "rng_state"
             )
         }
-        np.savez_compressed(
+        temporary_path = path.with_name(f".{path.name}.tmp.npz")
+        try:
+            np.savez_compressed(
+                temporary_path,
+                metadata=np.asarray(metadata, dtype=object),
+                states=payload["states"],
+                actions=payload["actions"],
+                rewards=payload["rewards"],
+                next_states=payload["next_states"],
+                terminateds=payload["terminateds"],
+                truncateds=payload["truncateds"],
+                dones=payload["dones"],
+                action_masks=np.asarray([], dtype=np.bool_)
+                if payload["action_masks"] is None
+                else payload["action_masks"],
+                next_action_masks=np.asarray([], dtype=np.bool_)
+                if payload["next_action_masks"] is None
+                else payload["next_action_masks"],
+            )
+            temporary_path.replace(path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        LOGGER.info(
+            "ReplayBuffer save complete path=%s bytes=%s elapsed_sec=%.3f",
             path,
-            metadata=np.asarray(metadata, dtype=object),
-            states=payload["states"],
-            actions=payload["actions"],
-            rewards=payload["rewards"],
-            next_states=payload["next_states"],
-            terminateds=payload["terminateds"],
-            truncateds=payload["truncateds"],
-            dones=payload["dones"],
-            action_masks=np.asarray([], dtype=np.bool_) if payload["action_masks"] is None else payload["action_masks"],
-            next_action_masks=np.asarray([], dtype=np.bool_)
-            if payload["next_action_masks"] is None
-            else payload["next_action_masks"],
+            path.stat().st_size,
+            time.perf_counter() - started,
         )
-        LOGGER.info("ReplayBuffer save complete path=%s", path)
 
     @classmethod
     def load(cls, path: PathLike) -> "ReplayBuffer":

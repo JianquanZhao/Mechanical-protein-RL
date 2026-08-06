@@ -7,7 +7,7 @@ Single machine, single GPU:
     python training.py --mode single --device cuda:0
 
 Single machine, multiple GPUs:
-    python training.py --mode multi --gpu-ids 0,1
+    python training.py --mode multi --gpu-ids 0,1,2,3 --batch-size 128
 
 CPU/debug run:
     python training.py --mode single --device cpu --epochs 1 --max-steps 1
@@ -21,13 +21,14 @@ import logging
 import sys
 import time
 from dataclasses import asdict
+from itertools import islice
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from model.agent_module.ddqn_agent import DDQNAgent, DDQNConfig
+from model.agent_module.ddqn_agent import DDQNAgent, DDQNConfig, OptimizationResult
 from model.dataset_module import ProteinStructureDataset
 from model.environment_module.environment import MechanicalProteinEnv
 from model.logging_module.training_logger import TrainingLogger, TrainingLoggerConfig
@@ -36,6 +37,10 @@ from model.replay_buffer_module.replay_buffer import ReplayBuffer
 
 DEFAULT_PDB_DIR = "model/reward_module"
 DEFAULT_OUTPUT_DIR = "outputs/ddqn_base"
+RESUME_AGENT_FILENAME = "agent.pt"
+RESUME_REPLAY_FILENAME = "replay_buffer.npz"
+RESUME_STATE_FILENAME = "training_state.json"
+RESUME_STATE_VERSION = 1
 LOGGER = logging.getLogger(__name__)
 
 
@@ -250,10 +255,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Full replay/optimizer batch processed by one backward pass. "
+            "When supplied, this sets --micro-batch-size to the same value and "
+            "--gradient-accumulation-steps to 1. This is the recommended option "
+            "for multi-GPU training; it is distinct from --train-batch-size."
+        ),
+    )
     parser.add_argument("--micro-batch-size", type=int, default=16)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--replay-warmup-size", type=int, default=1_000)
     parser.add_argument("--replay-capacity", type=int, default=100_000)
+    parser.add_argument(
+        "--train-frequency",
+        type=int,
+        default=1,
+        help=(
+            "Collect this many environment transitions between replay training "
+            "events. A value of 1 preserves the original update-after-every-step behavior."
+        ),
+    )
+    parser.add_argument(
+        "--gradient-steps",
+        type=int,
+        default=1,
+        help="Number of replay optimizer steps executed at each training event.",
+    )
     parser.add_argument("--target-sync-interval", type=int, default=250)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
     parser.add_argument("--huber-beta", type=float, default=1.0)
@@ -261,8 +292,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon-end", type=float, default=0.05)
     parser.add_argument("--epsilon-decay-steps", type=int, default=50_000)
     parser.add_argument("--use-amp", action="store_true")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+        help=(
+            "Autocast dtype used with --use-amp. bfloat16 is recommended on "
+            "RTX 4090/Ampere-or-newer GPUs because it avoids FP16 loss-scale overflow."
+        ),
+    )
+    parser.add_argument(
+        "--amp-max-retries",
+        type=int,
+        default=4,
+        help="Maximum automatic reduced-loss-scale retries after an FP16 gradient overflow.",
+    )
 
-    parser.add_argument("--checkpoint-every", type=int, default=25)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=25,
+        help="Save the small agent checkpoint every N completed episodes; 0 disables it.",
+    )
+    parser.add_argument(
+        "--replay-checkpoint-every",
+        type=int,
+        default=0,
+        help=(
+            "Save a resumable agent+replay bundle every N completed episodes. "
+            "This is expensive for ESM2 replay, so 0 disables periodic replay snapshots."
+        ),
+    )
+    parser.add_argument(
+        "--resume-checkpoint-dir",
+        default=None,
+        help=(
+            "Resume agent and replay from a directory containing agent.pt, "
+            "replay_buffer.npz, and preferably training_state.json."
+        ),
+    )
+    parser.add_argument(
+        "--resume-next-episode",
+        type=int,
+        default=None,
+        help=(
+            "Manual next episode for legacy checkpoint directories without "
+            "training_state.json. Prefer the recorded value when available."
+        ),
+    )
+    parser.add_argument(
+        "--no-save-final-replay",
+        action="store_false",
+        dest="save_final_replay",
+        help="Skip the expensive final replay snapshot; final agent weights are still saved.",
+    )
+    parser.set_defaults(save_final_replay=True)
     parser.add_argument("--save-candidates", action="store_true", default=True)
     parser.add_argument(
         "--no-save-candidates",
@@ -440,7 +524,28 @@ def build_agent_config(args: argparse.Namespace, *, device: str) -> DDQNConfig:
         epsilon_decay_steps=args.epsilon_decay_steps,
         device=device,
         use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
+        amp_max_retries=args.amp_max_retries,
         seed=args.seed,
+    )
+
+
+def apply_full_batch_shortcut(args: argparse.Namespace) -> None:
+    """Resolve --batch-size to one full batch with no gradient accumulation."""
+
+    batch_size = getattr(args, "batch_size", None)
+    if batch_size is None:
+        return
+    if int(batch_size) <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+
+    args.micro_batch_size = int(batch_size)
+    args.gradient_accumulation_steps = 1
+    LOGGER.info(
+        "Configured full-batch optimizer mode batch_size=%s "
+        "micro_batch_size=%s gradient_accumulation_steps=1",
+        batch_size,
+        args.micro_batch_size,
     )
 
 
@@ -472,12 +577,55 @@ def configure_training_mode(args: argparse.Namespace) -> Tuple[str, Tuple[int, .
     return f"cuda:{gpu_ids[0]}", gpu_ids
 
 
+def data_parallel_batch_plan(
+    config: DDQNConfig,
+    gpu_ids: Sequence[int],
+) -> dict[str, int]:
+    """Describe how each backward batch is split across DataParallel devices."""
+
+    gpu_count = len(gpu_ids)
+    batch_per_backward = int(config.micro_batch_size)
+    if gpu_count and batch_per_backward < gpu_count:
+        raise ValueError(
+            "Multi-GPU batch per backward pass must be at least the number of GPUs: "
+            f"batch_per_backward={batch_per_backward}, gpu_count={gpu_count}."
+        )
+
+    divisor = gpu_count if gpu_count else 1
+    return {
+        "gpu_count": gpu_count,
+        "effective_batch_size": int(config.effective_batch_size),
+        "batch_per_backward": batch_per_backward,
+        "gradient_accumulation_steps": int(config.gradient_accumulation_steps),
+        "per_gpu_batch_size": batch_per_backward // divisor,
+        "uneven_batch_remainder": batch_per_backward % divisor,
+    }
+
+
 def enable_data_parallel(agent: DDQNAgent, gpu_ids: Sequence[int]) -> None:
     if not gpu_ids:
         LOGGER.info("DataParallel disabled; using agent device=%s", agent.device)
         return
 
-    LOGGER.info("Wrapping online and target networks with DataParallel gpu_ids=%s", list(gpu_ids))
+    plan = data_parallel_batch_plan(agent.config, gpu_ids)
+    if plan["uneven_batch_remainder"]:
+        LOGGER.warning(
+            "DataParallel batch is not evenly divisible by GPU count; "
+            "batch_per_backward=%s gpu_count=%s remainder=%s",
+            plan["batch_per_backward"],
+            plan["gpu_count"],
+            plan["uneven_batch_remainder"],
+        )
+    LOGGER.info(
+        "Wrapping online and target networks with DataParallel gpu_ids=%s "
+        "effective_batch_size=%s batch_per_backward=%s per_gpu_batch_size=%s "
+        "gradient_accumulation_steps=%s",
+        list(gpu_ids),
+        plan["effective_batch_size"],
+        plan["batch_per_backward"],
+        plan["per_gpu_batch_size"],
+        plan["gradient_accumulation_steps"],
+    )
     agent.online_network = torch.nn.DataParallel(
         agent.online_network,
         device_ids=list(gpu_ids),
@@ -504,8 +652,198 @@ def save_agent_checkpoint(agent: DDQNAgent, path: Path) -> None:
     payload["online_network"] = unwrapped_state_dict(agent.online_network)
     payload["target_network"] = unwrapped_state_dict(agent.target_network)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
-    LOGGER.info("Saved agent checkpoint path=%s elapsed_sec=%.3f", path, time.perf_counter() - started)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        torch.save(payload, temporary_path)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    LOGGER.info(
+        "Saved agent checkpoint path=%s bytes=%s elapsed_sec=%.3f",
+        path,
+        path.stat().st_size,
+        time.perf_counter() - started,
+    )
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def save_resume_checkpoint(
+    *,
+    agent: DDQNAgent,
+    replay_buffer: ReplayBuffer,
+    checkpoint_dir: Path,
+    next_episode: int,
+    args: argparse.Namespace,
+) -> None:
+    """Save an episode-boundary agent/replay pair and consistency metadata."""
+
+    started = time.perf_counter()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    replay_path = checkpoint_dir / RESUME_REPLAY_FILENAME
+    agent_path = checkpoint_dir / RESUME_AGENT_FILENAME
+    state_path = checkpoint_dir / RESUME_STATE_FILENAME
+
+    LOGGER.info(
+        "Resume checkpoint started dir=%s next_episode=%s replay_size=%s",
+        checkpoint_dir,
+        next_episode,
+        len(replay_buffer),
+    )
+    replay_buffer.save(replay_path)
+    save_agent_checkpoint(agent, agent_path)
+    state = {
+        "version": RESUME_STATE_VERSION,
+        "next_episode": int(next_episode),
+        "agent_environment_steps": int(agent.environment_steps),
+        "agent_optimization_steps": int(agent.optimization_steps),
+        "replay_size": int(len(replay_buffer)),
+        "replay_capacity": int(replay_buffer.capacity),
+        "replay_position": int(replay_buffer.position),
+        "state_shape": list(agent.state_shape),
+        "action_dim": int(agent.action_dim),
+        "schedule": {
+            "dataset_seed": int(args.dataset_seed),
+            "train_batch_size": int(args.train_batch_size),
+            "no_shuffle_train": bool(args.no_shuffle_train),
+            "pdb_dir": str(args.pdb_dir),
+            "train_index": None if args.train_index is None else str(args.train_index),
+        },
+    }
+    _write_json_atomic(state_path, state)
+    LOGGER.info(
+        "Resume checkpoint complete dir=%s next_episode=%s elapsed_sec=%.3f",
+        checkpoint_dir,
+        next_episode,
+        time.perf_counter() - started,
+    )
+
+
+def load_resume_checkpoint(
+    *,
+    checkpoint_dir: Path,
+    agent_config: DDQNConfig,
+    expected_state_shape: Sequence[int],
+    expected_action_dim: int,
+    args: argparse.Namespace,
+) -> tuple[DDQNAgent, ReplayBuffer, int]:
+    """Restore an agent/replay pair and return the next dataset episode index."""
+
+    started = time.perf_counter()
+    agent_path = checkpoint_dir / RESUME_AGENT_FILENAME
+    replay_path = checkpoint_dir / RESUME_REPLAY_FILENAME
+    state_path = checkpoint_dir / RESUME_STATE_FILENAME
+    if not agent_path.is_file():
+        raise FileNotFoundError(f"Resume agent checkpoint not found: {agent_path}")
+    if not replay_path.is_file():
+        raise FileNotFoundError(f"Resume replay checkpoint not found: {replay_path}")
+
+    agent = DDQNAgent.from_checkpoint(
+        agent_path,
+        map_location=agent_config.device,
+        config_override=agent_config,
+    )
+    replay_buffer = ReplayBuffer.load(replay_path)
+
+    expected_shape = tuple(int(value) for value in expected_state_shape)
+    if tuple(agent.state_shape) != expected_shape:
+        raise ValueError(
+            "Resume agent state shape is incompatible with the current environment: "
+            f"{agent.state_shape} vs {expected_shape}."
+        )
+    if int(agent.action_dim) != int(expected_action_dim):
+        raise ValueError(
+            "Resume agent action dimension is incompatible with the current environment: "
+            f"{agent.action_dim} vs {expected_action_dim}."
+        )
+    if tuple(replay_buffer.state_shape) != expected_shape:
+        raise ValueError(
+            "Resume replay state shape is incompatible with the current environment: "
+            f"{replay_buffer.state_shape} vs {expected_shape}."
+        )
+    if int(replay_buffer.action_dim) != int(expected_action_dim):
+        raise ValueError(
+            "Resume replay action dimension is incompatible with the current environment: "
+            f"{replay_buffer.action_dim} vs {expected_action_dim}."
+        )
+
+    if state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if int(state.get("version", -1)) != RESUME_STATE_VERSION:
+            raise ValueError(f"Unsupported training-state version in {state_path}.")
+        next_episode = int(state["next_episode"])
+        if args.resume_next_episode is not None and int(args.resume_next_episode) != next_episode:
+            raise ValueError(
+                "--resume-next-episode disagrees with training_state.json: "
+                f"{args.resume_next_episode} vs {next_episode}."
+            )
+
+        consistency_checks = {
+            "agent_environment_steps": int(agent.environment_steps),
+            "agent_optimization_steps": int(agent.optimization_steps),
+            "replay_size": int(len(replay_buffer)),
+            "replay_capacity": int(replay_buffer.capacity),
+            "replay_position": int(replay_buffer.position),
+        }
+        for key, actual in consistency_checks.items():
+            if int(state[key]) != actual:
+                raise ValueError(
+                    f"Resume checkpoint is inconsistent for {key}: "
+                    f"metadata={state[key]} actual={actual}."
+                )
+
+        expected_schedule = {
+            "dataset_seed": int(args.dataset_seed),
+            "train_batch_size": int(args.train_batch_size),
+            "no_shuffle_train": bool(args.no_shuffle_train),
+            "pdb_dir": str(args.pdb_dir),
+            "train_index": None if args.train_index is None else str(args.train_index),
+        }
+        if state.get("schedule") != expected_schedule:
+            raise ValueError(
+                "Resume dataset schedule differs from the saved training state. "
+                f"saved={state.get('schedule')} current={expected_schedule}."
+            )
+    else:
+        if args.resume_next_episode is None:
+            raise ValueError(
+                f"Legacy resume directory {checkpoint_dir} has no {RESUME_STATE_FILENAME}; "
+                "supply --resume-next-episode explicitly."
+            )
+        next_episode = int(args.resume_next_episode)
+        LOGGER.warning(
+            "Resuming legacy checkpoint without consistency metadata dir=%s next_episode=%s",
+            checkpoint_dir,
+            next_episode,
+        )
+
+    if next_episode < 0:
+        raise ValueError("Resume next episode must be >= 0.")
+    LOGGER.info(
+        "Resume checkpoint loaded dir=%s next_episode=%s environment_steps=%s "
+        "optimization_steps=%s replay_size=%s replay_capacity=%s elapsed_sec=%.3f",
+        checkpoint_dir,
+        next_episode,
+        agent.environment_steps,
+        agent.optimization_steps,
+        len(replay_buffer),
+        replay_buffer.capacity,
+        time.perf_counter() - started,
+    )
+    return agent, replay_buffer, next_episode
 
 
 def write_run_config(
@@ -523,6 +861,12 @@ def write_run_config(
         "state_shape": list(state_shape),
         "action_dim": int(action_dim),
         "gpu_ids": list(gpu_ids),
+        "parallel_batch_plan": data_parallel_batch_plan(agent_config, gpu_ids),
+        "update_schedule": update_schedule_summary(
+            batch_size=agent_config.effective_batch_size,
+            train_frequency=args.train_frequency,
+            gradient_steps=args.gradient_steps,
+        ),
         "cuda_available": torch.cuda.is_available(),
         "cuda_device_count": torch.cuda.device_count(),
     }
@@ -567,7 +911,7 @@ def run_validation(
             "sequence": info.get("sequence"),
         }
         records.append(record)
-        LOGGER.info("Validation episode complete record=%s", record)
+        LOGGER.debug("Validation episode complete record=%s", record)
     return records
 
 
@@ -580,6 +924,76 @@ def validate_training_schedule_args(args: argparse.Namespace) -> None:
         raise ValueError("--train-batch-size must be a positive integer.")
     if args.epochs is None and int(args.episodes) <= 0:
         raise ValueError("--episodes must be a positive integer in legacy episode mode.")
+    if int(args.train_frequency) <= 0:
+        raise ValueError("--train-frequency must be a positive integer.")
+    if int(args.gradient_steps) <= 0:
+        raise ValueError("--gradient-steps must be a positive integer.")
+    if int(args.checkpoint_every) < 0:
+        raise ValueError("--checkpoint-every must be >= 0.")
+    if int(args.replay_checkpoint_every) < 0:
+        raise ValueError("--replay-checkpoint-every must be >= 0.")
+    if args.resume_next_episode is not None and int(args.resume_next_episode) < 0:
+        raise ValueError("--resume-next-episode must be >= 0.")
+    if args.resume_next_episode is not None and args.resume_checkpoint_dir is None:
+        raise ValueError("--resume-next-episode requires --resume-checkpoint-dir.")
+
+
+def update_schedule_summary(
+    *,
+    batch_size: int,
+    train_frequency: int,
+    gradient_steps: int,
+) -> dict[str, float | int]:
+    """Return the effective replay-update ratios for one collection schedule."""
+
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be a positive integer.")
+    if int(train_frequency) <= 0:
+        raise ValueError("train_frequency must be a positive integer.")
+    if int(gradient_steps) <= 0:
+        raise ValueError("gradient_steps must be a positive integer.")
+
+    return {
+        "train_frequency": int(train_frequency),
+        "gradient_steps": int(gradient_steps),
+        "gradient_updates_per_transition": float(gradient_steps / train_frequency),
+        "replay_samples_per_transition": float(
+            batch_size * gradient_steps / train_frequency
+        ),
+    }
+
+
+def should_run_optimizer_event(
+    completed_environment_steps: int,
+    train_frequency: int,
+) -> bool:
+    """Return whether a replay-training event is due after the latest step."""
+
+    if int(completed_environment_steps) <= 0:
+        raise ValueError("completed_environment_steps must be a positive integer.")
+    if int(train_frequency) <= 0:
+        raise ValueError("train_frequency must be a positive integer.")
+    return int(completed_environment_steps) % int(train_frequency) == 0
+
+
+def run_replay_optimization_event(
+    *,
+    agent: DDQNAgent,
+    replay_buffer: ReplayBuffer,
+    gradient_steps: int,
+) -> list[OptimizationResult]:
+    """Execute up to ``gradient_steps`` updates from the unchanged replay buffer."""
+
+    if int(gradient_steps) <= 0:
+        raise ValueError("gradient_steps must be a positive integer.")
+
+    results: list[OptimizationResult] = []
+    for _ in range(int(gradient_steps)):
+        result = agent.optimize_from_replay_buffer(replay_buffer)
+        if result is None:
+            break
+        results.append(result)
+    return results
 
 
 def planned_episode_count(args: argparse.Namespace, dataset: ProteinStructureDataset) -> int:
@@ -620,7 +1034,7 @@ def iter_training_episode_paths(
                 shuffle=not args.no_shuffle_train,
             )
         ):
-            LOGGER.info(
+            LOGGER.debug(
                 "Dataset batch ready epoch=%s/%s batch=%s batch_size=%s paths=%s",
                 epoch + 1,
                 int(args.epochs),
@@ -635,6 +1049,7 @@ def iter_training_episode_paths(
 def train(args: argparse.Namespace) -> None:
     if args.log_every_steps <= 0:
         raise ValueError("--log-every-steps must be a positive integer.")
+    apply_full_batch_shortcut(args)
     validate_training_schedule_args(args)
 
     run_started = time.perf_counter()
@@ -687,28 +1102,53 @@ def train(args: argparse.Namespace) -> None:
 
     agent_config = build_agent_config(args, device=device)
     LOGGER.info("Building DDQNAgent config=%s", asdict(agent_config))
-    agent = DDQNAgent(
-        state_shape=state.shape,
-        action_dim=env.action_space.n,
-        config=agent_config,
-    )
+    if args.resume_checkpoint_dir is None:
+        agent = DDQNAgent(
+            state_shape=state.shape,
+            action_dim=env.action_space.n,
+            config=agent_config,
+        )
+        replay_buffer = ReplayBuffer(
+            capacity=args.replay_capacity,
+            state_shape=state.shape,
+            action_dim=env.action_space.n,
+            seed=args.seed,
+            store_action_masks=True,
+            variable_length=args.observation_encoder == "esm2",
+        )
+        start_episode = 0
+    else:
+        agent, replay_buffer, start_episode = load_resume_checkpoint(
+            checkpoint_dir=Path(args.resume_checkpoint_dir).expanduser().resolve(),
+            agent_config=agent_config,
+            expected_state_shape=state.shape,
+            expected_action_dim=env.action_space.n,
+            args=args,
+        )
     enable_data_parallel(agent, gpu_ids)
 
-    replay_buffer = ReplayBuffer(
-        capacity=args.replay_capacity,
-        state_shape=state.shape,
-        action_dim=env.action_space.n,
-        seed=args.seed,
-        store_action_masks=True,
-        variable_length=args.observation_encoder == "esm2",
-    )
+    if start_episode > total_planned_episodes:
+        raise ValueError(
+            "Resume episode exceeds the configured training schedule: "
+            f"next_episode={start_episode}, planned_episodes={total_planned_episodes}."
+        )
     LOGGER.info(
-        "ReplayBuffer ready capacity=%s effective_batch_size=%s warmup=%s variable_length=%s",
-        args.replay_capacity,
+        "ReplayBuffer ready capacity=%s size=%s effective_batch_size=%s warmup=%s "
+        "variable_length=%s resumed=%s start_episode=%s",
+        replay_buffer.capacity,
+        len(replay_buffer),
         agent_config.effective_batch_size,
         agent_config.replay_warmup_size,
-        args.observation_encoder == "esm2",
+        replay_buffer.variable_length,
+        args.resume_checkpoint_dir is not None,
+        start_episode,
     )
+    update_schedule = update_schedule_summary(
+        batch_size=agent_config.effective_batch_size,
+        train_frequency=args.train_frequency,
+        gradient_steps=args.gradient_steps,
+    )
+    LOGGER.info("Replay optimization schedule=%s", update_schedule)
 
     logger = TrainingLogger(
         TrainingLoggerConfig(
@@ -738,14 +1178,20 @@ def train(args: argparse.Namespace) -> None:
         gpu_ids=gpu_ids,
     )
 
-    total_environment_steps = 0
+    total_environment_steps = int(agent.environment_steps)
 
     try:
+        episode_paths = iter_training_episode_paths(
+            args=args,
+            dataset=dataset,
+            rng=dataset_rng,
+        )
         for episode, (epoch, batch_index, batch_item_index, episode_pdb_path) in enumerate(
-            iter_training_episode_paths(args=args, dataset=dataset, rng=dataset_rng)
+            islice(episode_paths, start_episode, None),
+            start=start_episode,
         ):
             episode_started = time.perf_counter()
-            LOGGER.info(
+            LOGGER.debug(
                 "Episode %s/%s starting epoch=%s batch=%s batch_item=%s",
                 episode + 1,
                 total_planned_episodes,
@@ -754,7 +1200,7 @@ def train(args: argparse.Namespace) -> None:
                 batch_item_index,
             )
             state, info = env.reset(pdb_path=str(episode_pdb_path))
-            LOGGER.info(
+            LOGGER.debug(
                 "Episode %s reset epoch=%s batch=%s batch_item=%s pdb_path=%s "
                 "valid_actions=%s accepted_mutations=%s",
                 episode,
@@ -772,7 +1218,7 @@ def train(args: argparse.Namespace) -> None:
                 step_started = time.perf_counter()
                 action_mask = info["action_mask"]
                 valid_action_count = int(action_mask.sum())
-                LOGGER.info(
+                LOGGER.debug(
                     "Episode %s step %s global_step=%s selecting_action epsilon=%.6f valid_actions=%s",
                     episode,
                     episode_steps,
@@ -781,11 +1227,11 @@ def train(args: argparse.Namespace) -> None:
                     valid_action_count,
                 )
                 action = agent.select_action(state, action_mask=action_mask)
-                LOGGER.info("Selected action=%s for episode=%s step=%s", action, episode, episode_steps)
+                LOGGER.debug("Selected action=%s for episode=%s step=%s", action, episode, episode_steps)
 
                 next_state, reward, terminated, truncated, next_info = env.step(action)
                 decoded_action = next_info.get("decoded_action", {})
-                LOGGER.info(
+                LOGGER.debug(
                     "Environment step finished episode=%s step=%s action=%s decoded=%s "
                     "reward=%.6f step_reward=%.6f terminal_reward=%.6f accepted=%s reason=%s "
                     "terminated=%s truncated=%s truncation_reason=%s next_valid_actions=%s elapsed_sec=%.3f",
@@ -815,39 +1261,84 @@ def train(args: argparse.Namespace) -> None:
                     action_mask=action_mask,
                     next_action_mask=next_info["action_mask"],
                 )
-                LOGGER.info(
+                LOGGER.debug(
                     "ReplayBuffer add complete size=%s capacity=%s position=%s",
                     len(replay_buffer),
                     replay_buffer.capacity,
                     replay_buffer.position,
                 )
 
-                optimization_result = agent.optimize_from_replay_buffer(replay_buffer)
-                if optimization_result is not None:
-                    LOGGER.info(
-                        "Optimization step complete step=%s loss=%.8f mean_q=%.8f "
-                        "mean_target=%.8f mean_abs_td=%.8f grad_norm=%.8f target_synced=%s",
-                        optimization_result.optimization_step,
-                        optimization_result.loss,
-                        optimization_result.mean_q_value,
-                        optimization_result.mean_target_q_value,
-                        optimization_result.mean_absolute_td_error,
-                        optimization_result.grad_norm,
-                        optimization_result.target_synced,
+                completed_environment_steps = total_environment_steps + 1
+                if should_run_optimizer_event(
+                    completed_environment_steps,
+                    args.train_frequency,
+                ):
+                    optimizer_event = completed_environment_steps // args.train_frequency
+                    LOGGER.debug(
+                        "Replay optimization event started event=%s "
+                        "completed_environment_steps=%s gradient_steps=%s",
+                        optimizer_event,
+                        completed_environment_steps,
+                        args.gradient_steps,
                     )
-                    logger.log_optimization(
-                        optimization_result,
-                        global_step=total_environment_steps,
+                    optimization_results = run_replay_optimization_event(
+                        agent=agent,
+                        replay_buffer=replay_buffer,
+                        gradient_steps=args.gradient_steps,
                     )
+                    if optimization_results:
+                        for gradient_step_in_event, optimization_result in enumerate(
+                            optimization_results,
+                            start=1,
+                        ):
+                            LOGGER.debug(
+                                "Optimization step complete event=%s "
+                                "gradient_step=%s/%s step=%s loss=%.8f mean_q=%.8f "
+                                "mean_target=%.8f mean_abs_td=%.8f grad_norm=%.8f "
+                                "target_synced=%s amp_retries=%s amp_scale=%s",
+                                optimizer_event,
+                                gradient_step_in_event,
+                                args.gradient_steps,
+                                optimization_result.optimization_step,
+                                optimization_result.loss,
+                                optimization_result.mean_q_value,
+                                optimization_result.mean_target_q_value,
+                                optimization_result.mean_absolute_td_error,
+                                optimization_result.grad_norm,
+                                optimization_result.target_synced,
+                                optimization_result.amp_retries,
+                                optimization_result.amp_scale,
+                            )
+                            logger.log_optimization(
+                                optimization_result,
+                                global_step=total_environment_steps,
+                                extra={
+                                    "optimizer_event": optimizer_event,
+                                    "completed_environment_steps": completed_environment_steps,
+                                    "gradient_step_in_event": gradient_step_in_event,
+                                    "gradient_steps_requested": args.gradient_steps,
+                                    "train_frequency": args.train_frequency,
+                                },
+                            )
+                    else:
+                        required_size = max(
+                            agent_config.replay_warmup_size,
+                            agent_config.effective_batch_size,
+                        )
+                        LOGGER.debug(
+                            "Replay optimization event skipped for warmup "
+                            "event=%s replay_buffer_size=%s required_size=%s",
+                            optimizer_event,
+                            len(replay_buffer),
+                            required_size,
+                        )
                 else:
-                    required_size = max(
-                        agent_config.replay_warmup_size,
-                        agent_config.effective_batch_size,
-                    )
-                    LOGGER.info(
-                        "Optimization skipped replay_buffer_size=%s required_size=%s",
-                        len(replay_buffer),
-                        required_size,
+                    LOGGER.debug(
+                        "Replay optimization deferred completed_environment_steps=%s "
+                        "next_event_in=%s",
+                        completed_environment_steps,
+                        args.train_frequency
+                        - (completed_environment_steps % args.train_frequency),
                     )
 
                 logger.log_step(
@@ -885,9 +1376,9 @@ def train(args: argparse.Namespace) -> None:
             if args.save_candidates:
                 candidate_path = output_dir / "candidates" / f"episode_{episode:04d}.pdb"
                 candidate_path.parent.mkdir(parents=True, exist_ok=True)
-                LOGGER.info("Saving candidate PDB episode=%s path=%s", episode, candidate_path)
+                LOGGER.debug("Saving candidate PDB episode=%s path=%s", episode, candidate_path)
                 env.save_current_pose(candidate_path)
-                LOGGER.info("Saved candidate PDB episode=%s path=%s", episode, candidate_path)
+                LOGGER.debug("Saved candidate PDB episode=%s path=%s", episode, candidate_path)
 
             logger.end_episode(
                 episode=episode,
@@ -937,10 +1428,21 @@ def train(args: argparse.Namespace) -> None:
 
             if args.checkpoint_every > 0 and (episode + 1) % args.checkpoint_every == 0:
                 checkpoint_dir = output_dir / "checkpoints"
-                LOGGER.info("Periodic checkpoint triggered episode=%s dir=%s", episode, checkpoint_dir)
+                LOGGER.info("Periodic agent checkpoint triggered episode=%s dir=%s", episode, checkpoint_dir)
                 save_agent_checkpoint(agent, checkpoint_dir / "agent.pt")
-                replay_buffer.save(checkpoint_dir / "replay_buffer.npz")
-                LOGGER.info("Periodic checkpoint complete episode=%s dir=%s", episode, checkpoint_dir)
+                LOGGER.info("Periodic agent checkpoint complete episode=%s dir=%s", episode, checkpoint_dir)
+
+            if (
+                args.replay_checkpoint_every > 0
+                and (episode + 1) % args.replay_checkpoint_every == 0
+            ):
+                save_resume_checkpoint(
+                    agent=agent,
+                    replay_buffer=replay_buffer,
+                    checkpoint_dir=output_dir / "checkpoints" / "resume",
+                    next_episode=episode + 1,
+                    args=args,
+                )
 
             LOGGER.info(
                 "Episode summary episode=%s/%s epoch=%s batch=%s batch_item=%s reward=%.4f steps=%s "
@@ -960,7 +1462,10 @@ def train(args: argparse.Namespace) -> None:
     finally:
         LOGGER.info("Finalization started")
         save_agent_checkpoint(agent, output_dir / "checkpoints" / "agent_final.pt")
-        replay_buffer.save(output_dir / "checkpoints" / "replay_buffer_final.npz")
+        if args.save_final_replay:
+            replay_buffer.save(output_dir / "checkpoints" / "replay_buffer_final.npz")
+        else:
+            LOGGER.info("Final replay checkpoint skipped by --no-save-final-replay")
         plot_paths = logger.generate_plots()
         LOGGER.info("Generated final plots count=%s paths=%s", len(plot_paths), plot_paths)
         logger.close()
