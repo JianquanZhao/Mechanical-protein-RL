@@ -2372,3 +2372,210 @@ The resumed INFO output contained no per-action, per-ESM, per-replay-sample, or
 per-optimizer trace. The smoke validates checkpoint consistency and training-loop
 continuation; it intentionally does not load the active 47-49 GB F4 replay or
 start another four-GPU job.
+
+# Asynchronous actor-learner implementation (2026-08-07)
+
+## Motivation and design overview
+
+The previous `multi` mode used `torch.nn.DataParallel` only for replay-batch
+forward/backward passes. Protein loading, PyRosetta mutation/repack, reward
+calculation, and per-step ESM2 encoding still ran in one serial environment.
+The new `asynchronous` branch introduces an actor-learner pipeline that attacks
+the collection bottleneck directly:
+
+```text
+CPU PyRosetta actor processes
+        | sequence requests                 | transitions
+        v                                   v
+GPU 1-3 batched ESM2 workers        bounded event queue
+                                                |
+                                                v
+                                  GPU 0 DDQN learner + replay
+                                                |
+                                     periodic policy snapshots
+                                                |
+                                                v
+                                      CPU actor Q heads
+```
+
+The implementation uses `spawn`, not threads or CUDA-after-fork. Every actor
+owns its environment, Pose, reward calculators, RNG, and lightweight CPU Q
+head. PyRosetta Pose objects never cross a process boundary. Queues carry only
+sequences, NumPy embeddings, masks, rewards, episode metadata, and plain CPU
+network state dictionaries.
+
+## Detailed implementation
+
+### Batched ESM2 inference
+
+`model/encoding_module/esm2_encoder.py` now provides:
+
+- `encode_sequence(sequence)` for the compatible single-sequence path;
+- `encode_sequences(sequences)` for padded variable-length batches;
+- one ESM2 forward call per batch, followed by per-sequence removal of BOS,
+  EOS, and padding tokens;
+- `torch.inference_mode()` for inference-only execution.
+
+`model/asynchronous_module/runtime.py` adds a shared inference request queue,
+one response queue per actor, request IDs, timeout/error propagation, and
+dynamic batching. One worker is created per configured inference GPU. A worker
+waits for the first request, collects up to `--async-inference-batch-size`
+requests during `--async-inference-batch-wait-ms`, then executes one model call.
+The bounded queues provide backpressure when actors outrun inference or the
+learner.
+
+### Parallel PyRosetta actors
+
+Each actor process:
+
+1. creates an independent `MechanicalProteinEnv` and PyRosetta backend;
+2. obtains reset/step observations through `RemoteESM2Encoder`;
+3. selects masked epsilon-greedy actions with a CPU copy of the residue-wise Q
+   head;
+4. sends complete transition arrays to the central learner;
+5. sends episode summaries separately and optionally writes its own candidate
+   PDB;
+6. consumes only the latest available learner policy snapshot.
+
+The actor-side epsilon estimate advances by the actor count per local step so
+its decay approximates the global transition schedule between weight syncs.
+Every policy snapshot includes the authoritative global environment-step count,
+which corrects this estimate periodically. Actor seeds are separated by a
+deterministic offset.
+
+### Central learner
+
+`asynchronous_training.py` owns the only replay buffer and optimizer. It:
+
+- writes transitions to the existing variable-length padded replay buffer;
+- defines `environment_steps` as transitions accepted by the learner;
+- preserves global `--train-frequency F` / `--gradient-steps G` semantics;
+- runs the DDQN learner exclusively on `--device` (the production script uses
+  `cuda:0`);
+- broadcasts online-network CPU snapshots every
+  `--async-policy-sync-interval` optimizer steps;
+- tracks actor ID and policy version in step/episode records;
+- reports collection throughput and propagates all worker failures to the
+  parent process instead of waiting indefinitely.
+
+The root `training.py` parser now accepts `--mode asynchronous` and dispatches
+to the new learner. GPU overlap is rejected: the learner device and ESM2 worker
+GPU IDs must be disjoint.
+
+### Logging scalability
+
+The logger previously rewrote the complete episode CSV after every episode and
+retained every transition and optimizer record in memory. That behavior becomes
+prohibitively expensive for hundreds of thousands of episodes. New options are:
+
+```text
+--episode-csv-every 1000
+--max-step-records-in-memory 100000
+--max-optimization-records-in-memory 100000
+```
+
+JSONL remains the complete append-only source of truth. The limits only affect
+the recent in-memory window used to render plots. `episodes.csv` is refreshed
+periodically and once more during clean logger shutdown. Existing direct logger
+users retain the old defaults unless they select the new options.
+
+## Launch scripts
+
+The production launcher is `train_version_terminal_async.sh`. Its default GPU
+layout is:
+
+```text
+learner:             cuda:0
+ESM2 workers:        cuda:1,cuda:2,cuda:3
+PyRosetta actors:    12 CPU processes
+ESM2 batch size:     8 per worker
+update schedule:     F8/G1, replay batch 128
+```
+
+Start it with:
+
+```bash
+bash train_version_terminal_async.sh
+```
+
+The main tuning controls can be overridden without editing the script:
+
+```bash
+MPRL_ASYNC_ACTORS=8 \
+MPRL_ASYNC_INFERENCE_BATCH_SIZE=8 \
+MPRL_TRAIN_FREQUENCY=8 \
+bash train_version_terminal_async.sh
+```
+
+`train_asynchronous_smoke.sh` is the foreground two-GPU diagnostic launcher.
+It uses GPU 0 for the learner, GPU 1 for ESM2, two actors, four episodes, and
+two steps per episode.
+
+## Tests and observed results
+
+Automated tests cover variable-length ESM batching, remote request/response
+matching, dynamic worker batching, variable-length masked actor actions, and
+all pre-existing project behavior:
+
+```text
+targeted asynchronous/DDQN/replay/multi-GPU tests: 72 passed, 2 skipped
+complete project test suite:                       115 passed, 3 skipped
+bash syntax, Python compilation, git diff check:   passed
+```
+
+The real smoke test used the `mprl-vgpt` environment, two RTX 4090 GPUs, local
+ESM2 parameters, and two independent PyRosetta processes. No `nvidia-smi`
+decision was used; availability was established by the PyTorch CUDA runtime.
+
+```text
+episodes:                 4/4
+transitions:              8
+optimizer updates:        2
+final checkpoint:         written
+diagnostic figures:       10
+process exit code:        0
+total wall time:          41.083 s (includes ESM2/PyRosetta startup and plots)
+first actor episodes:     6.651 s and 6.822 s (cold start)
+later actor episodes:     0.850 s and 1.210 s
+```
+
+Artifacts are in:
+
+```text
+/tmp/mprl-async-smoke-20260807-codex-small
+```
+
+The first smoke attempt was manually stopped during validation of all 7701 PDB
+index entries, before workers started. The successful smoke used four training
+and two validation entries so it measured the asynchronous path rather than
+full dataset preprocessing.
+
+This smoke proves process isolation, remote ESM2 inference, replay ingestion,
+learner optimization, logging, checkpointing, and clean shutdown. It is not a
+throughput benchmark for the terminal-reward production workload. Actor counts
+8, 12, and 16 should be benchmarked with identical environment-step budgets;
+the best setting is the first one where ESM GPU utilization or learner queue
+latency saturates rather than the largest process count.
+
+## Current constraints
+
+- Exact replay resume is disabled in asynchronous mode. Completion order can
+  differ from episode ID, so a correct checkpoint must also atomically record
+  assigned and in-flight tasks. Agent-only periodic checkpoints are supported.
+- Periodic in-process validation is deferred. Blocking the learner for serial
+  validation can fill transition queues and distort collection throughput;
+  saved checkpoints should currently be evaluated by a separate process.
+- Every actor loads its own terminal random-forest artifact. Monitor host RAM
+  before increasing actor count substantially.
+- Three ESM2 model replicas require enough memory on GPUs 1-3. Lower
+  `MPRL_ASYNC_INFERENCE_GPUS` or the worker count if a selected checkpoint is
+  too large.
+
+## Branch status
+
+The local `asynchronous` branch was created from
+`feature/mechanical-property-predictor`. The initial remote push was blocked by
+the execution security review because repository visibility and outbound code
+scope could not be verified automatically. No workaround was attempted; remote
+synchronization remains pending explicit approval after this implementation is
+reviewed.

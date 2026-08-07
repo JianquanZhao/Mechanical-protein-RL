@@ -69,6 +69,9 @@ class TrainingLoggerConfig:
     resume: bool = True
     dpi: int = 160
     gradient_clip_threshold: Optional[float] = None
+    episode_csv_every: int = 1
+    max_step_records_in_memory: Optional[int] = None
+    max_optimization_records_in_memory: Optional[int] = None
 
     def validate(self) -> None:
         if self.rolling_window <= 0:
@@ -79,6 +82,20 @@ class TrainingLoggerConfig:
             raise ValueError("tensorboard_flush_secs must be > 0.")
         if self.dpi <= 0:
             raise ValueError("dpi must be > 0.")
+        if self.episode_csv_every <= 0:
+            raise ValueError("episode_csv_every must be > 0.")
+        if (
+            self.max_step_records_in_memory is not None
+            and self.max_step_records_in_memory <= 0
+        ):
+            raise ValueError("max_step_records_in_memory must be > 0 or None.")
+        if (
+            self.max_optimization_records_in_memory is not None
+            and self.max_optimization_records_in_memory <= 0
+        ):
+            raise ValueError(
+                "max_optimization_records_in_memory must be > 0 or None."
+            )
         if (
             self.gradient_clip_threshold is not None
             and self.gradient_clip_threshold <= 0
@@ -162,6 +179,14 @@ class TrainingLogger:
             )
             if config.save_step_records:
                 self.step_records = self._read_jsonl(self.steps_jsonl_path)
+            self.optimization_records = self._bounded_tail(
+                self.optimization_records,
+                config.max_optimization_records_in_memory,
+            )
+            self.step_records = self._bounded_tail(
+                self.step_records,
+                config.max_step_records_in_memory,
+            )
             LOGGER.info(
                 "TrainingLogger resumed records episodes=%s optimizations=%s steps=%s",
                 len(self.episode_records),
@@ -213,7 +238,11 @@ class TrainingLogger:
             record.update(self._json_safe_mapping(extra))
 
         record = self._numeric_json_safe_record(record)
-        self.optimization_records.append(record)
+        self._append_bounded(
+            self.optimization_records,
+            record,
+            self.config.max_optimization_records_in_memory,
+        )
 
         if self.config.save_optimization_records:
             self._append_jsonl(self.optimization_jsonl_path, record)
@@ -298,7 +327,11 @@ class TrainingLogger:
         if extra:
             record.update(self._json_safe_mapping(extra))
 
-        self.step_records.append(record)
+        self._append_bounded(
+            self.step_records,
+            record,
+            self.config.max_step_records_in_memory,
+        )
         if self.config.save_step_records:
             self._append_jsonl(self.steps_jsonl_path, record)
 
@@ -387,7 +420,8 @@ class TrainingLogger:
 
         self.episode_records.append(record)
         self._append_jsonl(self.episodes_jsonl_path, record)
-        self._write_episode_csv()
+        if len(self.episode_records) % self.config.episode_csv_every == 0:
+            self._write_episode_csv()
         LOGGER.debug(
             "Logged episode record episode=%s total_reward=%.6f steps=%s path=%s csv=%s",
             record["episode"],
@@ -677,12 +711,30 @@ class TrainingLogger:
         if self._closed:
             return
         LOGGER.info("Closing TrainingLogger")
+        if self.episode_records:
+            self._write_episode_csv()
         self.flush()
         if self._writer is not None and hasattr(self._writer, "close"):
             self._writer.close()
             LOGGER.info("TrainingLogger tensorboard writer closed")
         self._closed = True
         LOGGER.info("TrainingLogger closed")
+
+    @staticmethod
+    def _bounded_tail(records: List[Dict[str, Any]], limit: Optional[int]) -> List[Dict[str, Any]]:
+        if limit is None or len(records) <= limit:
+            return records
+        return records[-int(limit) :]
+
+    @staticmethod
+    def _append_bounded(
+        records: List[Dict[str, Any]],
+        record: Dict[str, Any],
+        limit: Optional[int],
+    ) -> None:
+        records.append(record)
+        if limit is not None and len(records) > int(limit):
+            del records[: len(records) - int(limit)]
 
     def __enter__(self) -> "TrainingLogger":
         return self

@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -114,29 +114,56 @@ class ESM2SequenceEncoder:
     def __call__(self, pose: Any, env: Any) -> np.ndarray:
         del pose
         sequence = str(env.current_sequence(mutable_only=self.mutable_only))
-        if not sequence:
-            raise ValueError("Cannot encode an empty protein sequence.")
+        return self.encode_sequence(sequence)
 
-        _, _, tokens = self.batch_converter([("protein", sequence)])
+    def encode_sequence(self, sequence: str) -> np.ndarray:
+        """Encode one sequence while preserving the historical callable API."""
+
+        return self.encode_sequences([sequence])[0]
+
+    def encode_sequences(self, sequences: Sequence[str]) -> list[np.ndarray]:
+        """Encode a padded, variable-length sequence batch in one model call."""
+
+        normalized = [str(sequence).strip().upper() for sequence in sequences]
+        if not normalized:
+            raise ValueError("sequences must contain at least one protein sequence.")
+        empty_indices = [index for index, sequence in enumerate(normalized) if not sequence]
+        if empty_indices:
+            raise ValueError(
+                "Cannot encode empty protein sequences at batch indices "
+                f"{empty_indices}."
+            )
+
+        records = [
+            (f"protein_{index}", sequence)
+            for index, sequence in enumerate(normalized)
+        ]
+        _, _, tokens = self.batch_converter(records)
         tokens = tokens.to(self.device)
 
         LOGGER.debug(
-            "Encoding sequence with ESM2 length=%s embedding_dim=%s device=%s output=per_residue",
-            len(sequence),
+            "Encoding ESM2 batch batch_size=%s min_length=%s max_length=%s "
+            "embedding_dim=%s device=%s output=per_residue",
+            len(normalized),
+            min(map(len, normalized)),
+            max(map(len, normalized)),
             self.embedding_dim,
             self.device,
         )
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(tokens, repr_layers=[self.representation_layer])
             representations = outputs["representations"][self.representation_layer]
 
-        # Token layout is BOS, residues..., EOS. Return only residue tokens.
-        embedding = representations[0, 1 : len(sequence) + 1]
-
-        array = embedding.detach().cpu().numpy().astype(np.float32, copy=False)
-        if array.shape != (len(sequence), self.embedding_dim):
-            raise RuntimeError(
-                "ESM2 per-residue embedding has shape "
-                f"{array.shape}, expected {(len(sequence), self.embedding_dim)}."
-            )
-        return array
+        encoded: list[np.ndarray] = []
+        for index, sequence in enumerate(normalized):
+            # Token layout is BOS, residues..., EOS, then optional padding.
+            embedding = representations[index, 1 : len(sequence) + 1]
+            array = embedding.detach().cpu().numpy().astype(np.float32, copy=False)
+            expected_shape = (len(sequence), self.embedding_dim)
+            if array.shape != expected_shape:
+                raise RuntimeError(
+                    "ESM2 per-residue embedding has shape "
+                    f"{array.shape}, expected {expected_shape}."
+                )
+            encoded.append(array)
+        return encoded

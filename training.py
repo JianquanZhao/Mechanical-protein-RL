@@ -54,9 +54,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--mode",
-        choices=("single", "multi"),
+        choices=("single", "multi", "asynchronous"),
         default="single",
-        help="Training mode. 'multi' uses torch.nn.DataParallel on one machine.",
+        help=(
+            "Training mode. 'multi' uses torch.nn.DataParallel; 'asynchronous' "
+            "uses CPU PyRosetta actors, batched ESM2 GPU workers, and one learner."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -70,6 +73,59 @@ def parse_args() -> argparse.Namespace:
         "--gpu-ids",
         default=None,
         help="Comma-separated GPU ids for multi mode, for example 0,1,2,3.",
+    )
+    parser.add_argument(
+        "--async-actors",
+        type=int,
+        default=8,
+        help="Number of independent PyRosetta actor processes in asynchronous mode.",
+    )
+    parser.add_argument(
+        "--async-inference-gpu-ids",
+        default="1,2,3",
+        help="Comma-separated GPU ids for batched ESM2 workers; disjoint from --device.",
+    )
+    parser.add_argument(
+        "--async-inference-batch-size",
+        type=int,
+        default=8,
+        help="Maximum number of variable-length sequences in one ESM2 inference batch.",
+    )
+    parser.add_argument(
+        "--async-inference-batch-wait-ms",
+        type=float,
+        default=10.0,
+        help="Maximum batching window after an ESM2 worker receives its first request.",
+    )
+    parser.add_argument(
+        "--async-queue-size",
+        type=int,
+        default=64,
+        help="Bounded inference/event queue capacity used for actor backpressure.",
+    )
+    parser.add_argument(
+        "--async-policy-sync-interval",
+        type=int,
+        default=100,
+        help="Learner optimizer steps between CPU actor policy broadcasts.",
+    )
+    parser.add_argument(
+        "--async-actor-torch-threads",
+        type=int,
+        default=1,
+        help="Torch CPU threads reserved by each actor's lightweight Q head.",
+    )
+    parser.add_argument(
+        "--async-start-method",
+        choices=("spawn", "forkserver"),
+        default="spawn",
+        help="Multiprocessing start method; spawn is safest with CUDA and PyRosetta.",
+    )
+    parser.add_argument(
+        "--async-timeout-seconds",
+        type=float,
+        default=300.0,
+        help="Worker startup, queue, and remote inference timeout.",
     )
 
     parser.add_argument("--pdb-dir", default=DEFAULT_PDB_DIR)
@@ -355,6 +411,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--plot-every-episodes", type=int, default=10)
     parser.add_argument("--rolling-window", type=int, default=20)
+    parser.add_argument(
+        "--episode-csv-every",
+        type=int,
+        default=1000,
+        help="Rewrite the compact episode CSV every N episodes; JSONL remains immediate.",
+    )
+    parser.add_argument(
+        "--max-step-records-in-memory",
+        type=int,
+        default=100_000,
+        help="Recent step records retained for plotting; JSONL keeps the complete history.",
+    )
+    parser.add_argument(
+        "--max-optimization-records-in-memory",
+        type=int,
+        default=100_000,
+        help="Recent optimizer records retained for plotting; JSONL keeps full history.",
+    )
     parser.add_argument("--enable-tensorboard", action="store_true")
     parser.add_argument("--no-resume-logs", action="store_true")
     parser.add_argument("--validate-every", type=int, default=25)
@@ -1047,6 +1121,12 @@ def iter_training_episode_paths(
 
 
 def train(args: argparse.Namespace) -> None:
+    if args.mode == "asynchronous":
+        from asynchronous_training import train_asynchronously
+
+        train_asynchronously(args)
+        return
+
     if args.log_every_steps <= 0:
         raise ValueError("--log-every-steps must be a positive integer.")
     apply_full_batch_shortcut(args)
@@ -1160,6 +1240,9 @@ def train(args: argparse.Namespace) -> None:
             enable_tensorboard=args.enable_tensorboard,
             resume=not args.no_resume_logs,
             gradient_clip_threshold=agent_config.max_grad_norm,
+            episode_csv_every=args.episode_csv_every,
+            max_step_records_in_memory=args.max_step_records_in_memory,
+            max_optimization_records_in_memory=args.max_optimization_records_in_memory,
         )
     )
     LOGGER.info(
