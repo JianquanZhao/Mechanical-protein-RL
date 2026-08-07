@@ -532,6 +532,8 @@ def test_gradient_clipping_returns_finite_norm() -> None:
         {"target_sync_interval": 0},
         {"max_grad_norm": 0.0},
         {"embedding_dim": 64},
+        {"amp_dtype": "float32"},
+        {"amp_max_retries": -1},
     ],
 )
 def test_config_validation(kwargs) -> None:

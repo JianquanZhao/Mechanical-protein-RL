@@ -82,3 +82,15 @@ def test_local_rmsd_penalizes_when_too_few_atoms_remain() -> None:
     assert status == "penalized_missing_atoms"
     assert atom_count == 0
     assert skipped == (1,)
+
+
+def test_penalty_term_is_bounded_unit_score() -> None:
+    assert StepRewardCalculator._penalty_to_unit_score(0.0, 2.0) == pytest.approx(1.0)
+    assert StepRewardCalculator._penalty_to_unit_score(1.0, 2.0) == pytest.approx(0.5)
+    assert StepRewardCalculator._penalty_to_unit_score(3.0, 2.0) == pytest.approx(0.0)
+
+
+def test_delta_term_is_bounded_unit_score() -> None:
+    assert StepRewardCalculator._delta_to_unit_score(0.0, 1.0) == pytest.approx(0.5)
+    assert 0.5 < StepRewardCalculator._delta_to_unit_score(1.0, 1.0) <= 1.0
+    assert 0.0 <= StepRewardCalculator._delta_to_unit_score(-1.0, 1.0) < 0.5
