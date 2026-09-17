@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SFT source manifest row",
+  "type": "object",
+  "required": ["protein_id", "pdb_path", "pdb_sha256", "sequence", "sequence_hash"],
+  "properties": {
+    "protein_id": {"type": "string"},
+    "pdb_path": {"type": "string"},
+    "pdb_sha256": {"type": "string"},
+    "sequence": {"type": "string", "pattern": "^[ACDEFGHIKLMNPQRSTVWY]+$"},
+    "sequence_hash": {"type": "string"}
+  }
+}
+

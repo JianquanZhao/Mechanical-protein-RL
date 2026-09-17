@@ -1,0 +1,64 @@
+version: sft_v001
+
+paths:
+  base_root: /mnt/nas/jianquanzhao/data/mprl/SFT
+  source_root: /mnt/nas/jianquanzhao/data/mprl/SFT/data/source
+  generated_root: /mnt/nas/jianquanzhao/data/mprl/SFT/data/generated
+  model_root: /mnt/nas/jianquanzhao/data/mprl/SFT/model
+  log_root: /mnt/nas/jianquanzhao/data/mprl/SFT/log
+  tensorboard_root: /mnt/nas/jianquanzhao/data/mprl/SFT/tensorboard
+
+source:
+  pdb_dir: /mnt/nas/jianquanzhao/data/mprl/pdbs/cath
+  train_index: /mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/indices/train_index.txt
+  reserved_validation_index: /mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/indices/val_index.txt
+  materialize: symlink
+  # Uses the exact sequence after the same PDB cleaning/PyRosetta load as RL.
+  # This is slower than text parsing but prevents action-position drift.
+  sequence_parser: environment
+  require_single_chain: true
+
+split:
+  # Production data uses sequence-similarity clusters. Use "exact" only for a
+  # dependency-light smoke test.
+  cluster_method: mmseqs
+  mmseqs_binary: mmseqs
+  min_sequence_identity: 0.30
+  coverage: 0.80
+  fractions:
+    train: 0.80
+    validation: 0.10
+    test: 0.10
+  seed: 20260917
+
+reward:
+  artifact_path: params/hbond_random_forest.joblib
+  local_repack_radius: 8.0
+  perform_repack: true
+  perform_minimize: false
+  minimize_backbone: false
+  step_reward_scale: 0.025
+  terminal_reward_scale: 8.0
+  rmsd_missing_atom_policy: penalize
+  rmsd_missing_penalty: 5.0
+  min_rmsd_atoms: 3
+  clean_pdb_before_load: true
+  max_missing_backbone_fraction: 0.05
+  pyrosetta_init_options: -mute all
+
+scan:
+  repeat_seeds: [11]
+  num_shards: 64
+  save_candidate_structures: false
+
+statistics:
+  confidence_level: 0.95
+  bootstrap_samples: 2000
+  positive_noise_boundary: 0.0
+  negative_noise_boundary: 0.0
+  target_column: marginal_reward_scaled
+
+search:
+  beam_width: 3
+  candidate_budget: 64
+  max_depth: 8

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SFT action label row",
+  "type": "object",
+  "required": ["state_id", "action_index", "reward_mean", "reward_lcb", "reward_ucb", "label_class"],
+  "properties": {
+    "state_id": {"type": "string"},
+    "action_index": {"type": "integer", "minimum": 0},
+    "reward_mean": {"type": "number"},
+    "reward_lcb": {"type": "number"},
+    "reward_ucb": {"type": "number"},
+    "label_class": {
+      "enum": ["confirmed_positive", "hard_negative", "near_zero_or_uncertain", "confirmed_negative", "structural_failure"]
+    }
+  }
+}
+
