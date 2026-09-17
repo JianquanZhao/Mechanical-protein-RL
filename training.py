@@ -32,7 +32,11 @@ from model.agent_module.ddqn_agent import DDQNAgent, DDQNConfig, OptimizationRes
 from model.dataset_module import ProteinStructureDataset
 from model.environment_module.environment import MechanicalProteinEnv
 from model.logging_module.training_logger import TrainingLogger, TrainingLoggerConfig
-from model.replay_buffer_module.replay_buffer import ReplayBuffer
+from model.replay_buffer_module import (
+    NStepTransitionAccumulator,
+    ReplayBuffer,
+    terminal_outcome_fields,
+)
 
 
 DEFAULT_PDB_DIR = "model/reward_module"
@@ -226,14 +230,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--step-reward-scale",
         type=float,
-        default=1.0,
-        help="Scale applied after bounded 0-1 step reward normalization.",
+        default=0.025,
+        help=(
+            "Scale applied to zero-centered step shaping. With max_steps=24, "
+            "the default bounds valid-action shaping magnitude by about 0.6."
+        ),
     )
     parser.add_argument(
         "--terminal-reward-scale",
         type=float,
-        default=1.0,
-        help="Scale applied to the structure-based terminal reward.",
+        default=8.0,
+        help=(
+            "Scale applied to final-minus-initial mechanical-property reward. "
+            "The default makes mechanical improvement dominate the weak, "
+            "zero-centered step shaping used by the base training script."
+        ),
     )
     parser.add_argument(
         "--no-terminal-reward",
@@ -249,9 +260,9 @@ def parse_args() -> argparse.Namespace:
         "--terminal-predicted-pdb-dir",
         default=None,
         help=(
-            "Optional directory containing sequence-predicted PDBs. When a matching "
-            "PDB is found, terminal reward averages PyRosetta terminal pose and "
-            "predicted structure 1:1."
+            "Legacy dual-structure option retained for CLI compatibility. The default "
+            "training reward compares the episode's PyRosetta initial and final poses "
+            "and does not use a static source-sequence prediction."
         ),
     )
     parser.add_argument(
@@ -292,6 +303,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-minimize", action="store_true")
     parser.add_argument("--minimize-backbone", action="store_true")
     parser.add_argument("--prevent-revisit-positions", action="store_true")
+    parser.add_argument(
+        "--include-visited-mask-in-observation",
+        action="store_true",
+        help=(
+            "Append one per-residue visited-position feature to ESM2 observations. "
+            "Use with --prevent-revisit-positions so the policy observes the same "
+            "episode-history constraint enforced by the action mask."
+        ),
+    )
     parser.add_argument("--raise-on-update-error", action="store_true", default=True)
     parser.add_argument(
         "--continue-on-update-error",
@@ -326,6 +346,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--replay-warmup-size", type=int, default=1_000)
     parser.add_argument("--replay-capacity", type=int, default=100_000)
+    parser.add_argument(
+        "--replay-sampling",
+        choices=("uniform", "prioritized"),
+        default="uniform",
+        help="Replay sampling mode. Uniform remains the backward-compatible default.",
+    )
+    parser.add_argument("--priority-alpha", type=float, default=0.6)
+    parser.add_argument("--priority-beta-start", type=float, default=0.4)
+    parser.add_argument("--priority-beta-end", type=float, default=1.0)
+    parser.add_argument("--priority-beta-steps", type=int, default=1_000_000)
+    parser.add_argument("--priority-epsilon", type=float, default=1e-6)
+    parser.add_argument(
+        "--positive-sample-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Target fraction of each replay batch drawn from distinct episodes "
+            "whose terminal reward LCB exceeds --positive-reward-lower-bound. "
+            "The quota is disabled at 0 and falls back when no positive rows exist."
+        ),
+    )
+    parser.add_argument(
+        "--positive-replay-reserve-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum positive-terminal fraction protected from ring-buffer "
+            "eviction after replay becomes full; must be within [0, 1)."
+        ),
+    )
+    parser.add_argument(
+        "--positive-reward-lower-bound",
+        "--positive-reward-threshold",
+        dest="positive_reward_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Terminal reward lower confidence bound must exceed this value to "
+            "enter the positive stratum. The old --positive-reward-threshold "
+            "name remains accepted for compatible launch scripts."
+        ),
+    )
+    parser.add_argument(
+        "--n-step",
+        type=int,
+        default=1,
+        help="Number of transitions in the discounted replay return; default 1.",
+    )
     parser.add_argument(
         "--train-frequency",
         type=int,
@@ -433,6 +501,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-resume-logs", action="store_true")
     parser.add_argument("--validate-every", type=int, default=25)
     parser.add_argument("--validation-episodes", type=int, default=5)
+    parser.add_argument("--validation-seed", type=int, default=17_291)
+    parser.add_argument("--validation-bootstrap-samples", type=int, default=1_000)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -506,19 +576,18 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
     terminal_reward_calculator = None
     if not args.no_terminal_reward:
         from model.reward_module.terminal_reward import (
-            EqualWeightDualStructureTerminalRewardCalculator,
+            MechanicalImprovementTerminalRewardCalculator,
         )
 
-        terminal_reward_calculator = EqualWeightDualStructureTerminalRewardCalculator(
+        terminal_reward_calculator = MechanicalImprovementTerminalRewardCalculator(
             artifact_path=args.terminal_reward_artifact,
-            predicted_pdb_dir=args.terminal_predicted_pdb_dir,
         )
         LOGGER.info(
-            "Enabled hbond topology terminal reward artifact=%s predicted_pdb_dir=%s "
-            "structure_weights=pyrosetta_terminal:1,predicted_structure:1 "
-            "objective_weights=strength:1,toughness:1",
+            "Enabled mechanical-improvement terminal reward artifact=%s "
+            "formula=0.5*delta_z_strength+0.5*delta_z_toughness "
+            "terminal_reward_scale=%s static_predicted_structure_used=false",
             args.terminal_reward_artifact,
-            args.terminal_predicted_pdb_dir,
+            args.terminal_reward_scale,
         )
     else:
         LOGGER.info("Terminal reward disabled by --no-terminal-reward")
@@ -548,6 +617,7 @@ def build_env(args: argparse.Namespace) -> MechanicalProteinEnv:
         perform_minimize=not args.no_minimize,
         minimize_backbone=args.minimize_backbone,
         prevent_revisit_positions=args.prevent_revisit_positions,
+        include_visited_mask_in_observation=args.include_visited_mask_in_observation,
         raise_on_update_error=args.raise_on_update_error,
         step_reward_scale=args.step_reward_scale,
         terminal_reward_scale=args.terminal_reward_scale,
@@ -1002,6 +1072,60 @@ def validate_training_schedule_args(args: argparse.Namespace) -> None:
         raise ValueError("--train-frequency must be a positive integer.")
     if int(args.gradient_steps) <= 0:
         raise ValueError("--gradient-steps must be a positive integer.")
+    if int(args.n_step) <= 0:
+        raise ValueError("--n-step must be a positive integer.")
+    if int(args.validate_every) < 0 or int(args.validation_episodes) < 0:
+        raise ValueError("Validation intervals and episode counts must be >= 0.")
+    if int(args.validation_bootstrap_samples) < 0:
+        raise ValueError("--validation-bootstrap-samples must be >= 0.")
+    if (
+        args.include_visited_mask_in_observation
+        and not args.prevent_revisit_positions
+    ):
+        raise ValueError(
+            "--include-visited-mask-in-observation requires "
+            "--prevent-revisit-positions."
+        )
+    if (
+        args.include_visited_mask_in_observation
+        and args.observation_encoder != "esm2"
+    ):
+        raise ValueError(
+            "--include-visited-mask-in-observation requires "
+            "--observation-encoder esm2."
+        )
+    if not np.isfinite(args.step_reward_scale) or args.step_reward_scale < 0:
+        raise ValueError("--step-reward-scale must be finite and >= 0.")
+    if not np.isfinite(args.terminal_reward_scale) or args.terminal_reward_scale < 0:
+        raise ValueError("--terminal-reward-scale must be finite and >= 0.")
+    if not 0.0 <= float(args.priority_alpha) <= 1.0:
+        raise ValueError("--priority-alpha must be within [0, 1].")
+    if not 0.0 <= float(args.priority_beta_start) <= 1.0:
+        raise ValueError("--priority-beta-start must be within [0, 1].")
+    if not float(args.priority_beta_start) <= float(args.priority_beta_end) <= 1.0:
+        raise ValueError("--priority-beta-end must be within [beta-start, 1].")
+    if int(args.priority_beta_steps) <= 0:
+        raise ValueError("--priority-beta-steps must be positive.")
+    if not np.isfinite(args.priority_epsilon) or args.priority_epsilon <= 0:
+        raise ValueError("--priority-epsilon must be finite and > 0.")
+    if not 0.0 <= float(args.positive_sample_fraction) <= 1.0:
+        raise ValueError("--positive-sample-fraction must be within [0, 1].")
+    if not 0.0 <= float(args.positive_replay_reserve_fraction) < 1.0:
+        raise ValueError(
+            "--positive-replay-reserve-fraction must be within [0, 1)."
+        )
+    if not np.isfinite(args.positive_reward_threshold):
+        raise ValueError("--positive-reward-lower-bound must be finite.")
+    if (
+        args.no_terminal_reward
+        and (
+            float(args.positive_sample_fraction) > 0.0
+            or float(args.positive_replay_reserve_fraction) > 0.0
+        )
+    ):
+        raise ValueError(
+            "Positive replay sampling/retention requires terminal reward metadata."
+        )
     if int(args.checkpoint_every) < 0:
         raise ValueError("--checkpoint-every must be >= 0.")
     if int(args.replay_checkpoint_every) < 0:
@@ -1195,6 +1319,17 @@ def train(args: argparse.Namespace) -> None:
             seed=args.seed,
             store_action_masks=True,
             variable_length=args.observation_encoder == "esm2",
+            sampling_strategy=args.replay_sampling,
+            priority_alpha=args.priority_alpha,
+            priority_beta_start=args.priority_beta_start,
+            priority_beta_end=args.priority_beta_end,
+            priority_beta_steps=args.priority_beta_steps,
+            priority_epsilon=args.priority_epsilon,
+            positive_sample_fraction=args.positive_sample_fraction,
+            positive_replay_reserve_fraction=(
+                args.positive_replay_reserve_fraction
+            ),
+            positive_reward_threshold=args.positive_reward_threshold,
         )
         start_episode = 0
     else:
@@ -1214,12 +1349,19 @@ def train(args: argparse.Namespace) -> None:
         )
     LOGGER.info(
         "ReplayBuffer ready capacity=%s size=%s effective_batch_size=%s warmup=%s "
-        "variable_length=%s resumed=%s start_episode=%s",
+        "variable_length=%s sampling_strategy=%s positive_sample_fraction=%s "
+        "positive_replay_reserve_fraction=%s positive_reward_lower_bound=%s "
+        "n_step=%s resumed=%s start_episode=%s",
         replay_buffer.capacity,
         len(replay_buffer),
         agent_config.effective_batch_size,
         agent_config.replay_warmup_size,
         replay_buffer.variable_length,
+        replay_buffer.sampling_strategy,
+        replay_buffer.positive_sample_fraction,
+        replay_buffer.positive_replay_reserve_fraction,
+        replay_buffer.positive_reward_threshold,
+        args.n_step,
         args.resume_checkpoint_dir is not None,
         start_episode,
     )
@@ -1296,6 +1438,10 @@ def train(args: argparse.Namespace) -> None:
             )
             episode_reward = 0.0
             episode_steps = 0
+            n_step_accumulator = NStepTransitionAccumulator(
+                n_step=args.n_step,
+                gamma=agent_config.gamma,
+            )
 
             while True:
                 step_started = time.perf_counter()
@@ -1334,18 +1480,30 @@ def train(args: argparse.Namespace) -> None:
                     time.perf_counter() - step_started,
                 )
 
-                replay_buffer.add(
-                    state=state,
-                    action=action,
-                    reward=reward,
-                    next_state=next_state,
-                    terminated=terminated,
-                    truncated=truncated,
-                    action_mask=action_mask,
-                    next_action_mask=next_info["action_mask"],
+                replay_rows = n_step_accumulator.append(
+                    {
+                        "state": state,
+                        "action": action,
+                        "reward": reward,
+                        "next_state": next_state,
+                        "terminated": terminated,
+                        "truncated": truncated,
+                        "action_mask": action_mask,
+                        "next_action_mask": next_info["action_mask"],
+                        "episode_id": episode,
+                        **terminal_outcome_fields(
+                            next_info,
+                            done=bool(terminated or truncated),
+                        ),
+                    }
                 )
+                for replay_row in replay_rows:
+                    replay_buffer.add(**replay_row)
                 LOGGER.debug(
-                    "ReplayBuffer add complete size=%s capacity=%s position=%s",
+                    "ReplayBuffer add complete emitted=%s n_step=%s size=%s "
+                    "capacity=%s position=%s",
+                    len(replay_rows),
+                    args.n_step,
                     len(replay_buffer),
                     replay_buffer.capacity,
                     replay_buffer.position,

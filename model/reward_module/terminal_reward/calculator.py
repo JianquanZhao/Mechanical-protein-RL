@@ -72,6 +72,32 @@ class DualStructureTerminalRewardResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class MechanicalImprovementTerminalRewardResult:
+    """Episode reward based on final-minus-initial mechanical predictions."""
+
+    reward: float
+    initial_result: StructureRewardResult
+    final_result: StructureRewardResult
+    delta_normalized_strength: float
+    delta_normalized_toughness: float
+    reward_components: Mapping[str, float]
+
+    @property
+    def raw_predictions(self) -> Mapping[str, float]:
+        return {
+            "strength": self.final_result.strength,
+            "toughness": self.final_result.toughness,
+        }
+
+    @property
+    def objective_vector(self) -> tuple[float, float]:
+        return (self.final_result.strength, self.final_result.toughness)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class HbondTopologyTerminalRewardCalculator:
     """
     Structure-based terminal reward using the random-split hbond random forest.
@@ -275,8 +301,10 @@ class EqualWeightDualStructureTerminalRewardCalculator:
         self,
         *,
         relaxed_pose: Any,
+        initial_pose: Optional[Any] = None,
         source_pdb_path: Optional[str | Path] = None,
     ) -> DualStructureTerminalRewardResult:
+        del initial_pose  # Accepted for compatibility with the environment API.
         predicted_pdb_path = self.resolve_predicted_pdb_path(source_pdb_path)
         relaxed_result = self.base_calculator.evaluate_pose(relaxed_pose)
         predicted_result = (
@@ -339,3 +367,73 @@ class EqualWeightDualStructureTerminalRewardCalculator:
                     if match.is_file():
                         return match
         return None
+
+
+class MechanicalImprovementTerminalRewardCalculator:
+    """
+    Reward mechanical-property improvement over the episode's initial Pose.
+
+    The training path deliberately uses the PyRosetta initial and terminal
+    poses from the same episode. A static structure predicted for the source
+    sequence is not a valid terminal structure after mutation and is therefore
+    excluded from this delta reward.
+    """
+
+    def __init__(
+        self,
+        *,
+        artifact_path: str | Path = DEFAULT_ARTIFACT_PATH,
+        force_retrain_artifact: bool = False,
+    ) -> None:
+        self.base_calculator = HbondTopologyTerminalRewardCalculator(
+            artifact_path=artifact_path,
+            scalarization=TerminalRewardScalarization(
+                strength_weight=1.0,
+                toughness_weight=1.0,
+                disagreement_penalty=0.0,
+                use_zscore=True,
+            ),
+            force_retrain_artifact=force_retrain_artifact,
+        )
+
+    def evaluate_pose(self, pose: Any) -> StructureRewardResult:
+        """Retain the single-pose API for offline absolute-score evaluation."""
+
+        return self.base_calculator.evaluate_pose(pose)
+
+    def evaluate_episode(
+        self,
+        *,
+        relaxed_pose: Any,
+        initial_pose: Optional[Any] = None,
+        source_pdb_path: Optional[str | Path] = None,
+    ) -> MechanicalImprovementTerminalRewardResult:
+        if initial_pose is not None:
+            initial_result = self.base_calculator.evaluate_pose(initial_pose)
+        elif source_pdb_path is not None:
+            initial_result = self.base_calculator.evaluate_pdb(source_pdb_path)
+        else:
+            raise ValueError(
+                "Mechanical improvement reward requires initial_pose or source_pdb_path."
+            )
+
+        final_result = self.base_calculator.evaluate_pose(relaxed_pose)
+        delta_strength = float(
+            final_result.normalized_strength - initial_result.normalized_strength
+        )
+        delta_toughness = float(
+            final_result.normalized_toughness - initial_result.normalized_toughness
+        )
+        components = {
+            "delta_strength": 0.5 * delta_strength,
+            "delta_toughness": 0.5 * delta_toughness,
+        }
+
+        return MechanicalImprovementTerminalRewardResult(
+            reward=float(sum(components.values())),
+            initial_result=initial_result,
+            final_result=final_result,
+            delta_normalized_strength=delta_strength,
+            delta_normalized_toughness=delta_toughness,
+            reward_components=components,
+        )

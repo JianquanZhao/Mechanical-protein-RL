@@ -4,13 +4,16 @@ import queue
 import threading
 
 import numpy as np
+import pytest
 import torch
 
 from model.asynchronous_module.runtime import (
     ActorPolicy,
     InferenceRequest,
     InferenceResponse,
+    LearnerProcessExited,
     RemoteESM2Encoder,
+    WorkerParentGuard,
     run_esm_inference_worker,
 )
 from model.encoding_module.esm2_encoder import ESM2SequenceEncoder
@@ -125,6 +128,24 @@ def test_inference_worker_dynamically_batches_requests() -> None:
 
     assert recording_encoder.batch_sizes == [3]
     assert [item.embedding.shape for item in returned] == [(2, 4), (3, 4), (4, 4)]
+
+
+def test_worker_parent_guard_can_be_disabled_for_in_process_workers() -> None:
+    guard = WorkerParentGuard(None)
+
+    guard.arm()
+    guard.check()
+
+
+def test_worker_parent_guard_detects_reparenting(monkeypatch) -> None:
+    guard = WorkerParentGuard(1234)
+    monkeypatch.setattr(
+        "model.asynchronous_module.runtime.os.getppid",
+        lambda: 1,
+    )
+
+    with pytest.raises(LearnerProcessExited, match="expected_ppid=1234"):
+        guard.check()
 
 
 def test_actor_policy_respects_variable_length_action_mask() -> None:

@@ -113,6 +113,28 @@ def test_log_optimization_persists_jsonl_and_tensorboard(tmp_path: Path) -> None
     assert "optimization/grad_norm" in tags
 
 
+def test_log_validation_persists_summary_and_tensorboard(tmp_path: Path) -> None:
+    writer = DummyWriter()
+    logger = TrainingLogger(
+        TrainingLoggerConfig(output_dir=tmp_path),
+        tensorboard_writer=writer,
+    )
+
+    record = logger.log_validation(
+        {"strength_mean": 0.25, "toughness_positive_fraction": 0.75},
+        global_step=123,
+        extra={"validation_run": 2},
+    )
+
+    assert record["global_step"] == 123
+    assert read_jsonl(tmp_path / "logs" / "validation_summary.jsonl")[0][
+        "strength_mean"
+    ] == pytest.approx(0.25)
+    tags = {tag for tag, _, _ in writer.scalars}
+    assert "validation/strength_mean" in tags
+    assert "validation/toughness_positive_fraction" in tags
+
+
 def test_log_step_extracts_reward_components_and_terminal_reward(tmp_path: Path) -> None:
     logger = make_logger(tmp_path)
 
@@ -136,6 +158,20 @@ def test_log_step_extracts_reward_components_and_terminal_reward(tmp_path: Path)
             },
             "terminal_reward_metrics": {
                 "reward": 7.0,
+                "delta_normalized_strength": 0.25,
+                "delta_normalized_toughness": -0.5,
+                "initial_result": {
+                    "strength": 10.0,
+                    "toughness": 20.0,
+                    "normalized_strength": -1.0,
+                    "normalized_toughness": 0.5,
+                },
+                "final_result": {
+                    "strength": 12.0,
+                    "toughness": 18.0,
+                    "normalized_strength": -0.75,
+                    "normalized_toughness": 0.0,
+                },
             },
         },
     )
@@ -147,6 +183,10 @@ def test_log_step_extracts_reward_components_and_terminal_reward(tmp_path: Path)
     assert record["reward_component/collision"] == pytest.approx(-1.5)
     assert record["reward_component/backbone_hbond"] == pytest.approx(2.0)
     assert record["terminal_reward"] == pytest.approx(7.0)
+    assert record["mechanical_delta_strength_z"] == pytest.approx(0.25)
+    assert record["mechanical_delta_toughness_z"] == pytest.approx(-0.5)
+    assert record["mechanical_initial_strength"] == pytest.approx(10.0)
+    assert record["mechanical_final_toughness"] == pytest.approx(18.0)
 
     persisted = read_jsonl(tmp_path / "logs" / "steps.jsonl")
     assert persisted == [record]
@@ -164,12 +204,20 @@ def test_end_episode_writes_jsonl_and_csv(tmp_path: Path) -> None:
         info={
             "sequence": "AAAA",
             "terminal_reward": 2.0,
+            "terminal_reward_metrics": {
+                "delta_normalized_strength": 0.4,
+                "delta_normalized_toughness": 0.2,
+                "initial_result": {"strength": 1.0, "toughness": 2.0},
+                "final_result": {"strength": 1.5, "toughness": 2.5},
+            },
         },
         generate_plots=False,
     )
 
     assert record["total_reward"] == pytest.approx(8.5)
     assert record["terminal_reward"] == pytest.approx(2.0)
+    assert record["mechanical_delta_strength_z"] == pytest.approx(0.4)
+    assert record["mechanical_final_strength"] == pytest.approx(1.5)
 
     jsonl = read_jsonl(tmp_path / "logs" / "episodes.jsonl")
     assert jsonl == [record]
@@ -183,6 +231,7 @@ def test_end_episode_writes_jsonl_and_csv(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["episode"] == "0"
     assert rows[0]["sequence"] == "AAAA"
+    assert rows[0]["mechanical_delta_toughness_z"] == "0.2"
 
 
 def test_periodic_plot_generation_is_triggered(tmp_path: Path, monkeypatch) -> None:

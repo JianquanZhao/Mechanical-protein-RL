@@ -4,6 +4,8 @@ from .calculator import (
     DualStructureTerminalRewardResult,
     EqualWeightDualStructureTerminalRewardCalculator,
     HbondTopologyTerminalRewardCalculator,
+    MechanicalImprovementTerminalRewardCalculator,
+    MechanicalImprovementTerminalRewardResult,
     StructureRewardResult,
     TerminalRewardScalarization,
 )
@@ -25,6 +27,8 @@ __all__ = [
     "HbondFeatureExtractor",
     "HbondFeatureResult",
     "HbondTopologyTerminalRewardCalculator",
+    "MechanicalImprovementTerminalRewardCalculator",
+    "MechanicalImprovementTerminalRewardResult",
     "SELECTED_HBOND_FEATURES",
     "StructureRewardResult",
     "TerminalRewardScalarization",

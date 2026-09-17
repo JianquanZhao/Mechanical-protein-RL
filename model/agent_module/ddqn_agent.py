@@ -132,9 +132,18 @@ class OptimizationResult:
     epsilon: float
     amp_retries: int = 0
     amp_scale: Optional[float] = None
+    mean_importance_weight: float = 1.0
+    mean_sampling_probability: Optional[float] = None
+    priority_beta: Optional[float] = None
+    mean_n_steps: float = 1.0
+    sample_indices: Optional[np.ndarray] = None
+    absolute_td_errors: Optional[np.ndarray] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result.pop("sample_indices", None)
+        result.pop("absolute_td_errors", None)
+        return result
 
 
 class QNetwork(nn.Module):
@@ -166,9 +175,9 @@ class QNetwork(nn.Module):
         if not hidden_dims or any(value <= 0 for value in hidden_dims):
             raise ValueError("hidden_dims must contain positive integers.")
 
-        is_per_residue_shape = _is_per_residue_state_shape(
-            self.state_shape,
-            self.embedding_dim,
+        is_per_residue_shape = (
+            len(self.state_shape) == 2
+            and self.state_shape[1] in (self.embedding_dim, self.embedding_dim + 1)
         )
         if (
             is_per_residue_shape
@@ -179,9 +188,14 @@ class QNetwork(nn.Module):
                 f"got action_dim={self.action_dim}, residues={self.state_shape[0]}."
             )
         self.per_residue_mode = is_per_residue_shape
+        self.state_feature_dim = int(self.state_shape[-1])
 
         if self.per_residue_mode:
-            dimensions = (self.embedding_dim, *hidden_dims, AMINO_ACID_ACTION_DIM)
+            dimensions = (
+                self.state_feature_dim,
+                *hidden_dims,
+                AMINO_ACID_ACTION_DIM,
+            )
             layers = []
             for input_dim, output_dim in zip(dimensions[:-2], dimensions[1:-1]):
                 layers.append(nn.Linear(input_dim, output_dim))
@@ -216,11 +230,11 @@ class QNetwork(nn.Module):
             if states.ndim != 3:
                 raise ValueError(
                     "Per-residue states must have shape (batch, residues, "
-                    f"{self.embedding_dim}), got {tuple(states.shape)}."
+                    f"{self.state_feature_dim}), got {tuple(states.shape)}."
                 )
-            if states.shape[-1] != self.embedding_dim:
+            if states.shape[-1] != self.state_feature_dim:
                 raise ValueError(
-                    f"Expected per-residue embedding dimension {self.embedding_dim}, "
+                    f"Expected per-residue feature dimension {self.state_feature_dim}, "
                     f"got {states.shape[-1]}."
                 )
             batch_size, residue_count, _ = states.shape
@@ -286,6 +300,7 @@ class DDQNAgent:
         self.state_shape = _validate_state_shape(state_shape)
         self.action_dim = _validate_positive_int(action_dim, "action_dim")
         self.config = config
+        self.state_feature_dim = int(self.state_shape[-1])
         self.per_residue_mode = _is_per_residue_state_shape(
             self.state_shape,
             config.embedding_dim,
@@ -468,6 +483,7 @@ class DDQNAgent:
         rewards: Tensor,
         dones: Tensor,
         next_action_masks: Optional[Tensor],
+        n_steps: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Calculate Double DQN TD targets.
@@ -519,8 +535,16 @@ class DDQNAgent:
                 index=next_actions,
             ).squeeze(1)
 
+            if n_steps is None:
+                bootstrap_discounts = torch.full_like(rewards, self.config.gamma)
+            else:
+                bootstrap_discounts = torch.pow(
+                    torch.full_like(rewards, self.config.gamma),
+                    n_steps.to(dtype=rewards.dtype),
+                )
+
             return rewards + (
-                self.config.gamma
+                bootstrap_discounts
                 * (~dones.to(dtype=torch.bool)).to(dtype=rewards.dtype)
                 * selected_next_q_target
             )
@@ -553,8 +577,23 @@ class DDQNAgent:
             self.config.effective_batch_size,
             len(replay_buffer),
         )
-        batch = replay_buffer.sample(self.config.effective_batch_size)
-        return self.optimize_batch(batch)
+        if getattr(replay_buffer, "sampling_strategy", "uniform") == "prioritized":
+            batch = replay_buffer.sample(
+                self.config.effective_batch_size,
+                replace=True,
+                step=self.environment_steps,
+            )
+        else:
+            batch = replay_buffer.sample(self.config.effective_batch_size)
+        result = self.optimize_batch(batch)
+        if getattr(replay_buffer, "sampling_strategy", "uniform") == "prioritized":
+            if result.sample_indices is None or result.absolute_td_errors is None:
+                raise RuntimeError("Prioritized replay optimization did not return TD errors.")
+            replay_buffer.update_priorities(
+                result.sample_indices,
+                result.absolute_td_errors,
+            )
+        return result
 
     def optimize_batch(self, batch: Any) -> OptimizationResult:
         """
@@ -597,6 +636,7 @@ class DDQNAgent:
         total_q_sum = 0.0
         total_target_sum = 0.0
         total_absolute_td_error_sum = 0.0
+        absolute_td_errors = np.empty(total_size, dtype=np.float32)
         micro_batches = 0
 
         for start in range(0, total_size, self.config.micro_batch_size):
@@ -615,6 +655,11 @@ class DDQNAgent:
             rewards = self._tensor(arrays["rewards"][start:stop], torch.float32)
             next_states = self._tensor(arrays["next_states"][start:stop], torch.float32)
             dones = self._tensor(arrays["dones"][start:stop], torch.bool)
+            n_steps = self._tensor(arrays["n_steps"][start:stop], torch.float32)
+            importance_weights = self._tensor(
+                arrays["importance_weights"][start:stop],
+                torch.float32,
+            )
 
             next_action_masks_array = arrays["next_action_masks"]
             next_action_masks = (
@@ -632,6 +677,7 @@ class DDQNAgent:
                     rewards=rewards,
                     dones=dones,
                     next_action_masks=next_action_masks,
+                    n_steps=n_steps,
                 )
 
                 q_values = self.online_network(states)
@@ -643,12 +689,13 @@ class DDQNAgent:
                 # Sum reduction followed by division by total_size makes
                 # micro-batch accumulation equal to a mean loss over the full
                 # effective batch, even for an uneven final chunk.
-                loss_sum = F.smooth_l1_loss(
+                per_sample_loss = F.smooth_l1_loss(
                     selected_q_values,
                     td_targets,
                     beta=self.config.huber_beta,
-                    reduction="sum",
+                    reduction="none",
                 )
+                loss_sum = (per_sample_loss * importance_weights).sum()
                 scaled_loss = loss_sum / total_size
 
             if self._grad_scaler_enabled:
@@ -657,6 +704,9 @@ class DDQNAgent:
                 scaled_loss.backward()
 
             td_errors = td_targets.detach() - selected_q_values.detach()
+            absolute_td_errors[start:stop] = (
+                td_errors.abs().to(dtype=torch.float32).cpu().numpy()
+            )
             total_loss_sum += float(loss_sum.detach().item())
             total_q_sum += float(selected_q_values.detach().sum().item())
             total_target_sum += float(td_targets.detach().sum().item())
@@ -758,6 +808,20 @@ class DDQNAgent:
                 if self._grad_scaler_enabled
                 else None
             ),
+            mean_importance_weight=float(np.mean(arrays["importance_weights"])),
+            mean_sampling_probability=(
+                None
+                if arrays["sampling_probabilities"] is None
+                else float(np.mean(arrays["sampling_probabilities"]))
+            ),
+            priority_beta=arrays["priority_beta"],
+            mean_n_steps=float(np.mean(arrays["n_steps"])),
+            sample_indices=(
+                None
+                if arrays["sample_indices"] is None
+                else arrays["sample_indices"].copy()
+            ),
+            absolute_td_errors=absolute_td_errors,
         )
         LOGGER.debug(
             "DDQN optimize_batch complete optimization_step=%s loss=%.8f "
@@ -894,7 +958,7 @@ class DDQNAgent:
     # Validation and utilities
     # ------------------------------------------------------------------
 
-    def _coerce_replay_batch(self, batch: Any) -> Dict[str, Optional[np.ndarray]]:
+    def _coerce_replay_batch(self, batch: Any) -> Dict[str, Any]:
         required_names = (
             "states",
             "actions",
@@ -913,10 +977,10 @@ class DDQNAgent:
         dones = np.asarray(batch.dones, dtype=np.bool_)
 
         if self.per_residue_mode:
-            if states.ndim != 3 or states.shape[-1] != self.config.embedding_dim:
+            if states.ndim != 3 or states.shape[-1] != self.state_feature_dim:
                 raise ValueError(
                     "Per-residue batch states must have shape "
-                    f"(batch, residues, {self.config.embedding_dim}), got {states.shape}."
+                    f"(batch, residues, {self.state_feature_dim}), got {states.shape}."
                 )
         else:
             if states.ndim != len(self.state_shape) + 1:
@@ -948,6 +1012,47 @@ class DDQNAgent:
         if not np.all(np.isfinite(rewards)):
             raise ValueError("rewards contain NaN or infinity.")
 
+        n_steps_value = getattr(batch, "n_steps", None)
+        n_steps = (
+            np.ones(batch_size, dtype=np.int64)
+            if n_steps_value is None
+            else np.asarray(n_steps_value, dtype=np.int64)
+        )
+        if n_steps.shape != (batch_size,) or np.any(n_steps <= 0):
+            raise ValueError("n_steps must contain positive values with shape (batch_size,).")
+
+        importance_value = getattr(batch, "importance_weights", None)
+        importance_weights = (
+            np.ones(batch_size, dtype=np.float32)
+            if importance_value is None
+            else np.asarray(importance_value, dtype=np.float32)
+        )
+        if importance_weights.shape != (batch_size,):
+            raise ValueError("importance_weights must have shape (batch_size,).")
+        if not np.all(np.isfinite(importance_weights)) or np.any(importance_weights <= 0.0):
+            raise ValueError("importance_weights must be finite and > 0.")
+
+        sampling_value = getattr(batch, "sampling_probabilities", None)
+        sampling_probabilities = (
+            None
+            if sampling_value is None
+            else np.asarray(sampling_value, dtype=np.float32)
+        )
+        if sampling_probabilities is not None:
+            if sampling_probabilities.shape != (batch_size,):
+                raise ValueError("sampling_probabilities must have shape (batch_size,).")
+            if not np.all(np.isfinite(sampling_probabilities)) or np.any(
+                sampling_probabilities <= 0.0
+            ):
+                raise ValueError("sampling_probabilities must be finite and > 0.")
+
+        indices_value = getattr(batch, "indices", None)
+        sample_indices = (
+            None if indices_value is None else np.asarray(indices_value, dtype=np.int64)
+        )
+        if sample_indices is not None and sample_indices.shape != (batch_size,):
+            raise ValueError("indices must have shape (batch_size,).")
+
         next_action_masks_value = getattr(batch, "next_action_masks", None)
         next_action_masks: Optional[np.ndarray]
         if next_action_masks_value is None:
@@ -966,16 +1071,21 @@ class DDQNAgent:
             "rewards": rewards,
             "next_states": next_states,
             "dones": dones,
+            "n_steps": n_steps,
+            "importance_weights": importance_weights,
+            "sampling_probabilities": sampling_probabilities,
+            "priority_beta": getattr(batch, "priority_beta", None),
+            "sample_indices": sample_indices,
             "next_action_masks": next_action_masks,
         }
 
     def _coerce_single_state(self, state: Any) -> np.ndarray:
         array = np.asarray(state, dtype=np.float32)
         if self.per_residue_mode:
-            if array.ndim != 2 or array.shape[-1] != self.config.embedding_dim:
+            if array.ndim != 2 or array.shape[-1] != self.state_feature_dim:
                 raise ValueError(
                     "per-residue state must have shape "
-                    f"(residues, {self.config.embedding_dim}), got {array.shape}."
+                    f"(residues, {self.state_feature_dim}), got {array.shape}."
                 )
         elif array.shape != self.state_shape:
             raise ValueError(
@@ -1009,10 +1119,10 @@ class DDQNAgent:
 
     def _action_dim_for_state_batch(self, states: np.ndarray) -> int:
         if self.per_residue_mode:
-            if states.ndim != 3 or states.shape[-1] != self.config.embedding_dim:
+            if states.ndim != 3 or states.shape[-1] != self.state_feature_dim:
                 raise ValueError(
                     "Per-residue batch states must have shape "
-                    f"(batch, residues, {self.config.embedding_dim}), got {states.shape}."
+                    f"(batch, residues, {self.state_feature_dim}), got {states.shape}."
                 )
             return int(states.shape[1]) * AMINO_ACID_ACTION_DIM
         return self.action_dim
@@ -1103,7 +1213,10 @@ def _is_per_residue_state_shape(
     embedding_dim: int,
 ) -> bool:
     shape = tuple(int(value) for value in state_shape)
-    return len(shape) == 2 and shape[-1] == int(embedding_dim)
+    return len(shape) == 2 and shape[-1] in (
+        int(embedding_dim),
+        int(embedding_dim) + 1,
+    )
 
 
 def _torch_load(

@@ -2579,3 +2579,2719 @@ the execution security review because repository visibility and outbound code
 scope could not be verified automatically. No workaround was attempted; remote
 synchronization remains pending explicit approval after this implementation is
 reviewed.
+
+# 异步与串行 F8/G1 训练对比分析（2026-08-07）
+
+## 分析对象与口径
+
+本次比较使用：
+
+```text
+异步日志：async_a12_esm8_f8_g1_20260807_111457/train_stdout.log
+串行日志：update_frequency_f8_g1_bs128_h24_20260806_155311/train_stdout.log
+```
+
+两次训练的主要共同参数是 batch size 128、F8/G1、replay warmup 4096、
+replay capacity 50000、`max_steps=24`、学习率 `1e-4`、无 AMP。为了避免
+冷启动和 replay warmup 影响，速度主比较区间选择两边共同经历的
+`global_step=50000 -> 99000`，共 49000 个 transition。稳定性比较选择
+两边共同具有的前 12023 次 optimizer update。
+
+该实验并不是完全严格的单变量对照，至少存在三个重要差异：
+
+1. 串行版 `target_sync_interval=63`，异步版为 125；
+2. 串行版每 240 episodes 运行 16 个 validation episodes，异步版将周期
+   validation 延后到独立 checkpoint 评估；
+3. 串行版每 2400 episodes 保存约 47-49 GB replay，异步版关闭周期 replay
+   checkpoint。
+
+因此下面同时报告原始端到端速度和扣除这些维护任务后的训练流水线速度。
+
+## 速度量化结果
+
+### 原始端到端吞吐
+
+在 `50k -> 99k transitions` 区间：
+
+| 版本 | 开始时间 | 结束时间 | 用时 | 吞吐 | 折算 episodes/hour |
+|---|---:|---:|---:|---:|---:|
+| 异步 A12 | 13:07:19 | 14:42:48 | 5729 s | 8.55 step/s | 1283 |
+| 串行 | 19:34:47 | 00:05:01 | 16214 s | 3.02 step/s | 453 |
+
+原始端到端结果为：
+
+```text
+吞吐倍数：8.55 / 3.02 = 2.83x
+速度提升：(2.83 - 1) * 100% = 183%
+完成同样 49000 transitions 的墙钟时间减少：64.7%
+```
+
+如果该稳态吞吐始终保持不变，完成 492864 个 24-step episodes 的粗略
+外推约为异步 16.0 天、串行 45.3 天。该数字只能用于容量规划，不能替代
+完整训练实测，因为后续 checkpoint、绘图、文件增长和硬件负载会变化。
+
+### 扣除非等价维护任务
+
+相同区间内，串行版发生了：
+
+```text
+9 次绘图 + 9 次 16-episode validation：553 s
+1 次 49 GB replay checkpoint：             2722.942 s
+维护总时间：                               3275.942 s
+```
+
+异步版发生 9 次绘图，共 78 s，没有周期 validation 和 replay checkpoint。
+扣除这些不等价任务后：
+
+| 版本 | 估计有效训练时间 | 有效吞吐 |
+|---|---:|---:|
+| 异步 A12 | 5651 s | 8.67 step/s |
+| 串行 | 12938.058 s | 3.79 step/s |
+
+较公平的训练流水线提升为：
+
+```text
+有效吞吐倍数：8.67 / 3.79 = 2.29x
+有效速度提升：129%
+有效训练时间减少：56.3%
+```
+
+在原始时间差 10485 s 中，约 3198 s（30.5%）来自 validation、绘图和
+replay checkpoint 配置差异；约 7287 s（69.5%）来自异步采样和批量 ESM2
+流水线本身。因此“速度约提升 1 倍”的判断是合理且偏保守的；严格按相同
+训练工作量，当前证据支持约 2.3 倍吞吐，而不是 12 倍。
+
+## 是否符合理论提升
+
+### 与朴素 12 倍上限的差距
+
+12 个 actor 的 12 倍只是所有工作都能独立并行、没有共享瓶颈和资源竞争
+时的上限，当前实现显然不满足这些条件。稳态区间中：
+
+```text
+串行普通 episode 平均耗时（排除每 240 次维护 episode）：6.338 s
+异步单 actor episode 平均耗时：                         22.509 s
+单个异步 actor 相比串行变慢：                           3.55x
+12 actors 按实测单 actor 服务时间计算的容量上限：        12.80 step/s
+异步实际有效吞吐：                                      8.67 step/s
+并行流水线利用率：                                      67.7%
+```
+
+CPU/GPU 竞争已经把理论相对上限从朴素的 12 倍压缩到约
+`12 / 3.55 = 3.38x`；实际获得 2.29 倍，相当于该实测容量上限的约 67.7%。
+对于第一版包含 PyRosetta、ESM2、IPC 和 learner 的异步流水线，这个结果
+合理，但仍有明确优化空间。
+
+### 未达到更高加速比的原因
+
+1. **PyRosetta CPU 与内存竞争**：12 个进程同时进行 PDB 清洗、Pose 构建、
+   mutation 和 repack，争用 CPU core、内存带宽、文件系统和临时文件目录。
+
+2. **ESM2 实际 batch 难以达到 8**：只有 12 个同步等待响应的 actor，却有
+   3 个 ESM worker。均匀分配时每个 worker 同时只能看到约 4 个请求，配置的
+   batch size 8 多数时候只是上限，并不代表实际 batch 为 8。
+
+3. **随机长度 padding 浪费**：不同长度蛋白被放入同一 ESM batch，整个
+   batch 按最长序列 padding。一个长蛋白会显著增加同 batch 中短蛋白的计算量。
+
+4. **大数组跨进程复制**：每个 `L x 1280` float32 embedding 先从 ESM worker
+   回到 actor，再随 state/next_state 发送到 learner；相邻 transition 还会重复
+   发送前一步的 next_state，产生序列化、内存复制和 IPC 压力。
+
+5. **actor 是同步 RPC 客户端**：每个 actor 每一步都等待 ESM 返回，不能在
+   同一 actor 内将结构计算、下一请求和当前 embedding 传输重叠起来。
+
+6. **共享 learner 和日志主循环**：GPU 0 learner、replay padding/sample、JSONL、
+   TensorBoard、绘图和 episode task 分发都在主进程。绘图期间主进程不能及时
+   排空 event queue，也不能马上给空闲 actor 分发下一任务。
+
+7. **蛋白长度和结构复杂度造成 straggler**：异步 episode 的 p95 耗时约
+   35.1 s，均值 23.9 s。慢结构会占用 actor slot，并降低 12 个 actor 的整体利用率。
+
+## Loss、Q value 和 TD error 峰值量化
+
+以前 12023 次 optimizer update 为共同区间：
+
+| 指标 | 异步最大值 | 串行最大值 | 异步/串行 | 串行/异步 |
+|---|---:|---:|---:|---:|
+| loss | 18.085 | 274.089 | 6.60% | 15.16x |
+| mean absolute TD error | 18.557 | 274.588 | 6.76% | 14.80x |
+| mean Q value | 161.007 | 1880.970 | 8.56% | 11.68x |
+| grad norm | 66.189 | 261.510 | 25.31% | 3.95x |
+
+最近 500 次共同 update 的均值更贴近 TensorBoard 中观察到的“约 1/10”：
+
+| 指标 | 异步均值 | 串行均值 | 异步/串行 |
+|---|---:|---:|---:|
+| loss | 7.789 | 75.670 | 10.3% |
+| mean absolute TD error | 8.209 | 76.162 | 10.8% |
+| mean Q value | 155.297 | 1417.813 | 11.0% |
+
+该差异不是由异步版获得了更小的 reward 造成的。前 99000 transitions 的
+reward 统计几乎一致：
+
+```text
+异步 step reward：  mean=0.6451, std=0.1791
+串行 step reward：  mean=0.6424, std=0.1796
+异步 episode return：mean=15.4839, std=1.0856
+串行 episode return：mean=15.4179, std=1.1342
+```
+
+因此 Q/TD 峰值下降主要来自训练动力学和样本组织方式，而不是 reward scale。
+
+## 峰值下降的机制分析
+
+### 1. transition 时间相关性被大幅削弱
+
+串行版连续写入同一个 24-step episode，前 99000 transitions 中相邻记录仍
+属于同一 episode 的比例为 95.83%，连续 run 的中位数是 24。异步版来自
+12 个 actor 交错写入，相邻记录属于同一 episode 的比例只有 0.0081%，连续
+run 中位数为 1、最大值为 2。
+
+这使 replay 在训练早期就同时包含多种蛋白、位置和突变轨迹，降低连续相似
+状态造成的梯度同向累积。虽然 replay buffer 满后 uniform sampling 本身也会
+打乱顺序，但在线训练过程看到的“当时 buffer 内容”仍更丰富，尤其是在最容易
+出现 bootstrap 正反馈的 update 1000-5000 区间。该区间串行/异步峰值比分别
+达到 loss 19.59 倍、TD error 18.64 倍、Q value 15.40 倍。
+
+### 2. actor policy lag 切断即时正反馈
+
+异步 actor 每 100 optimizer steps 接收一次 learner 权重。日志中 actor 相对
+learner 的平均滞后约 58 optimizer updates，即约 464 transitions；p95 滞后约
+103 updates，即约 824 transitions。
+
+串行版中 online Q 一旦高估某些 action，这些 action 会立即影响下一步 greedy
+采样，新 transition 又会反过来强化相同 Q 估计。异步版的旧策略行为相当于一个
+低通滤波器，learner 的短期异常不会马上同步到所有 actor。DDQN 是 off-policy
+算法，可以使用这些较旧策略产生的数据，因此适度 policy lag 在这里起到了稳定
+作用。过大的 lag 仍可能损害最终策略质量，不能把“越旧越稳定”等同于“越好”。
+
+### 3. target network 更新频率降低
+
+共同 12023 updates 内：
+
+```text
+异步 target sync：96 次，interval=125
+串行 target sync：190 次，interval=63
+```
+
+串行版大约每 504 transitions 将 online network 的高估复制到 target；异步版
+约每 1000 transitions 才复制一次。较慢 target sync 延缓了
+`online overestimate -> target increase -> TD target increase -> online increase`
+的 bootstrap 正反馈，这很可能是峰值下降的重要原因之一。
+
+这也是当前实验最重要的混杂变量。没有在相同 target interval 下重跑之前，不能
+把 10 倍稳定性改善全部归因于异步 actor。
+
+### 4. 多 actor 的独立随机轨迹提高覆盖度
+
+12 个 actor 使用不同 RNG seed，并在不同蛋白上同步探索。即使全局 epsilon
+相同，随机 action、结构更新耗时和完成顺序也不同。较高的状态动作覆盖度降低了
+单一轨迹中偶然高 Q action 被反复强化的概率。
+
+### 5. Huber loss 与 TD error 本来就会同步变化
+
+当前 `huber_beta=1`。当绝对 TD error 远大于 1 时，Smooth L1 loss 近似
+`abs(TD error) - 0.5`。因此 loss 和 mean absolute TD error 同时下降约 15 倍
+并不是两个独立机制，而是 TD target 与 Q 差距下降在两个统计量上的一致表现。
+
+## 仍然存在的稳定性问题
+
+异步版是显著改善，不是彻底解决。共同区间内异步 mean Q 峰值仍为 161，最近
+500 updates 的均值仍约 155，而实际未折扣 episode return 均值只有约 15.48；
+折扣 return 还会更低。也就是说异步 Q 仍大约高估一个数量级，只是串行版最近
+均值约 1418 的近百倍高估被强烈抑制了。
+
+异步日志末端的 recent-500 指标为：
+
+```text
+loss=7.789, TD error=8.209, grad norm=24.913, mean Q=155.297
+```
+
+其中 grad norm 仍经常高于 clip threshold 10，Q value 也仍处于高平台。后续
+判断应继续依赖固定验证集实际 return、terminal strength/toughness 改善和
+Q-versus-Monte-Carlo-return calibration，而不能只凭 loss 峰值较低就判断策略
+已经收敛。
+
+## 结论与下一组必要对照
+
+1. 异步版本原始端到端吞吐为串行版 2.83 倍；去除不等价 validation、绘图和
+   replay checkpoint 后，核心流水线约为 2.29 倍。速度提升真实且主要来自架构，
+   但并未达到 12 actors 的朴素 12 倍理论上限。
+
+2. 当前 2.29 倍约达到依据实测 actor 服务时间推导容量上限的 67.7%。下一步
+   提速应优先记录 ESM 实际 batch size、request wait、actor PyRosetta time、IPC
+   time 和 learner duty cycle，并尝试按序列长度 bucket batching。
+
+3. loss、TD error、Q value 下降到约 1/10 的观察成立。主要解释是 transition
+   去相关、独立 actor 探索和 policy lag 抑制即时反馈，同时 target sync 从 63
+   改为 125 也显著减慢高估传播。
+
+4. 最小因果对照应固定相同数据、步数、validation/checkpoint 配置并依次比较：
+   `serial-target125`、`async-target125-policy-sync100`、
+   `async-target63-policy-sync100`、`async-target125-policy-sync1`。只有这样才能
+   分离异步采样、target sync 和 policy staleness 各自对稳定性的贡献。
+
+# 2026-08-10：三日异步训练的 actor 扩容与 total reward 分析
+
+## 分析范围
+
+本次分析读取：
+
+```text
+/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/
+async_a12_esm8_f8_g1_20260807_111457/
+```
+
+量化快照包含 `98,611 / 492,864` 个 episode、`2.36M+` transitions 和
+`295k+` optimizer updates，约完成总计划的 20%。配置为 12 个 PyRosetta
+actor、3 个 ESM2 inference worker、F8/G1、batch size 128、24 steps/episode、
+`epsilon_end=0.05`、无 AMP。该任务在分析期间仍在写日志；本次没有停止进程，
+也没有修改训练代码。
+
+## 是否应停止 A12 并增加 actor
+
+停止当前三日 A12 任务、保留其作为诊断基线，然后测试更多 actor，方向合理：
+
+1. A12 已跨越 12 个完整 epoch，足以确认吞吐、reward 平台和数值行为，不必再用
+   13 天仅验证同一个平台是否延续。
+2. 当前平均吞吐约 `8.336 step/s`，约 `1,250 episode/hour`，外推完整 64 epoch
+   总耗时约 16.4 天，与 15–17 天的观察一致。
+3. 单 actor episode 平均耗时 `23.05 s`，12 actor 按实测服务时间计算的容量约为
+   `12 * 24 / 23.05 = 12.50 step/s`；实际 8.336 step/s，相当于约 66.7% 的
+   actor-side 容量利用率。增加并发有机会隐藏 ESM2/IPC/learner 等待并提高 batch
+   填充率，但当前仍有约三分之一损失来自共享流水线，不能期待 actor 数量线性加速。
+4. 服务器有 56 个物理核、112 个逻辑 CPU 和约 79 GiB available memory，A18/A24
+   在 CPU 数量上可行；但 swap 已使用约 `7.9/8.0 GiB`，继续扩容前必须监测每个
+   PyRosetta actor 的 RSS、内存带宽和 NUMA 竞争。
+
+不建议立即启动更大 actor 数量的 64-epoch 完整训练。推荐依次运行 A12、A18、A24
+的相同短基准，每组至少经过 replay warmup，并比较固定 20k–50k transitions 区间。
+三张 ESM GPU、每 worker batch size 8 时，A24 是第一个值得重点测试的配置，因为
+理论上可为每张 GPU 提供约 8 个并发请求。只有 A24 的 ESM 实际 batch size、队列
+等待、actor p95、learner duty cycle 和内存均健康时，才继续测试 A32/A36。
+
+当前异步模式不保存可精确恢复的 replay/in-flight task 状态，因此停止后不能从
+现有 agent checkpoint 精确续跑同一随机过程。最新周期 checkpoint 可保留用于离线
+评估，但 actor 数量对比和下一次完整训练应从相同初始权重、seed 和空 replay 开始，
+否则吞吐与策略效果会混入 warm-start 差异。当前 checkpoints 与 logs 分别约为
+2.5 GiB 和 3.9 GiB，也应适当降低 plot/checkpoint/CSV 刷新频率后再做扩容测试。
+
+## 当前 total reward 的精确定义
+
+当前 `total_reward` **不是**“episode 终态力学性能减去初态力学性能”。异步 actor
+在 `model/asynchronous_module/runtime.py` 中执行：
+
+```text
+episode_total_reward = sum(reward_t for t in 1..T)
+reward_t = step_reward_t                         (非终止步)
+reward_T = step_reward_T + terminal_reward_T    (最后一步)
+```
+
+因此本次固定 24-step episode 的记录是：
+
+```text
+total_reward = 24 个 normalized step reward 的和 + 1 个 terminal reward
+```
+
+step reward 虽然由当前结构相对 previous/reference 的碰撞、氢键和局部 RMSD 构成，
+但经过非线性 0–1 映射并带有正基线，不能像势函数差那样在 24 步后相消为
+`final - initial`。terminal reward 也是终态预测 strength/toughness 的绝对 z-score
+平均，而不是相对初始结构的增量。
+
+此外，当前 dual-structure wrapper 根据 **source PDB stem** 查找预先生成的预测结构。
+命中时，该 predicted PDB 对同一 source protein 的所有 mutation episode 都不变，
+并不是根据本 episode 的 terminal mutated sequence 重新预测的结构；其 50% 分量会
+稀释终态突变信号。未命中时才只使用 PyRosetta terminal packed structure。
+
+## total reward 趋势的量化结果
+
+全部 98,611 个 episode：
+
+| 指标 | 均值 | 标准差 | 与 total reward 的相关性 |
+|---|---:|---:|---:|
+| total reward | 15.9659 | 1.1421 | 1.000 |
+| 24-step reward sum | 16.0442 | 1.1849 | 0.897 |
+| terminal reward | -0.0783 | 0.5293 | 0.149 |
+
+terminal reward 均值只占 total reward 均值的约 `-0.49%`，total reward 主要由
+24 个正值 step reward 决定。按完整 epoch 比较：
+
+| Epoch | Episodes | Total | Step sum | Terminal | Mean epsilon |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 7,701 | 15.7082 | 15.7929 | -0.0847 | 0.1756 |
+| 1 | 7,701 | 15.9753 | 16.0528 | -0.0776 | 0.0500 |
+| 5 | 7,701 | 15.9578 | 16.0372 | -0.0794 | 0.0500 |
+| 8 | 7,701 | 16.0077 | 16.0864 | -0.0787 | 0.0500 |
+| 11 | 7,701 | 16.0186 | 16.0974 | -0.0788 | 0.0500 |
+
+epoch 0 到 epoch 1 的 `+0.2671` 主要与 epsilon 从探索阶段降至 0.05 同时发生。
+排除该阶段后，同一批 7,701 个 PDB 在 epoch 1 到 epoch 11 的配对结果为：
+
+```text
+total reward mean delta:   +0.0434（约 +0.27%）
+step reward sum delta:     +0.0446
+terminal reward delta:     -0.0012
+reward improved fraction:  50.81%
+```
+
+改善比例接近 50%，说明 plateau 后没有可检测的、跨蛋白一致的策略提升。episode
+completion order 与 total reward 的 Pearson 相关仅 `0.0428`，terminal reward 与
+顺序的相关仅 `0.0032`。图中最初的上升是真实的 step-policy 改善，但后续基本持平。
+
+## 为什么 loss/TD error 回落但 total reward 不增长
+
+### 1. TD 收敛不等于策略改善
+
+DDQN loss 衡量 Q 与 bootstrap target 是否一致，不直接衡量 terminal mechanical
+property。online/target network 可以收敛到彼此一致但整体高估的固定点。最新 5,000
+次 update 均值仍为：
+
+```text
+loss=3.492, mean_abs_td=3.746, mean_q=81.73,
+mean_target_q=78.39, grad_norm=8.87
+```
+
+而 episode total reward 均值只有约 15.97；按 `gamma=0.99` 折扣后 return 还更低。
+Q 仍显著高估，所以“从峰值回落”应称为数值稳定化，尚不能称为价值校准完成。
+
+### 2. 正基线 step reward 淹没 terminal 信号
+
+中性氢键变化被映射为 0.5；不增加 collision loss 时碰撞项为 1；相邻结构 RMSD
+很小时 RMSD 项接近 1。一个几乎不改变结构的动作可以得到约 `0.7857` 的 step
+reward。固定 24 步会累积约 16 分，而 terminal reward 只在最后出现一次、均值约
+-0.078。优化总回报最容易的方向因此是“每一步少破坏”，不是提高终态 strength
+或 toughness。
+
+首尾各 10,000 transitions 的比较进一步显示：
+
+```text
+step reward:                 0.6174 -> 0.6750
+collision unit score:        0.4573 -> 0.6337
+backbone hbond unit score:   0.4917 -> 0.4990
+sidechain hbond unit score:  0.4765 -> 0.4984
+local RMSD unit score:       0.9905 -> 0.9961
+```
+
+主要进步来自减少“相对上一步”的 collision 恶化，氢键项只是回到中性基线，不能
+证明力学性能提高。
+
+### 3. step reward 存在局部安全但全局不优的漏洞
+
+当前默认 `collision_penalty_mode="delta"`、`rmsd_penalty_mode="previous"`。
+只要本步 collision 不比上一步更差，collision 项就可得到满分，即使当前结构已经
+远差于 episode 初始结构。日志中一个终止 transition 的 collision score 为 81.60、
+reference 为 11.55，但由于它比 previous 的 87.64 有所下降，collision reward 仍为
+1.0。最后 10,000 steps 的 current collision 相对 reference 平均约 6.60 倍，
+`collision_excess_over_reference > 10` 的比例仍为 74.59%。
+
+这会鼓励“先恶化、再局部恢复”或反复突变，而不是保持全局结构质量。当前
+`prevent_revisit_positions=false`，重复位置修改与反向突变进一步放大该问题。
+
+### 4. training reward 混合不同蛋白，且没有固定验证曲线
+
+每个 episode 从不同 CATH PDB 开始，不同蛋白的基线、长度、可突变位置和预测器
+难度不同。训练 total reward 是 epsilon-greedy、stale actor policy 下的 on-run
+统计，不是同一初态上的 deterministic evaluation。本次配置为
+`validate_every=0, validation_episodes=0`，所以现有曲线本来就不是适合判断策略
+改善的指标。正确主指标应是固定 validation PDB、固定初始结构、`epsilon=0` 下的：
+
+```text
+delta terminal strength, delta terminal toughness,
+delta terminal reward, success/top-k rate, Q-versus-realized-return calibration
+```
+
+### 5. observation 与 reward 仍存在部分可观测性
+
+ESM2 observation 主要编码当前序列，但 reward 依赖 PyRosetta 当前 Pose、相对上一步
+结构、初始 reference、已访问位置和剩余 horizon。网络不能仅凭序列恢复这些变量，
+相同或相似序列可能对应不同结构历史和不同 TD target，限制了 Q 与策略的可学习性。
+
+## 推荐的下一阶段顺序
+
+1. **先做吞吐 benchmark，不直接做完整训练**：A12/A18/A24 各跑相同 20k–50k
+   transitions，关闭高频绘图，记录 ESM 实际 batch size、inference wait、PyRosetta
+   time、IPC time、event queue depth、policy lag、RSS 和吞吐；按 step 数而非运行时间
+   比较。
+2. **建立固定验证器**：每个 checkpoint 在相同 validation PDB 上用 epsilon=0 评估，
+   同时保存 initial/final strength、toughness 和结构质量。没有该曲线，不应启动
+   15 天完整训练。
+3. **把优化目标改为 improvement**：terminal reward 使用
+   `z(property_final) - z(property_initial)`；在不能为 terminal mutated sequence
+   实时预测结构前，不把静态 source predicted PDB 当作 50% 的终态评分。
+4. **降低 step reward 的生存基线**：将 step reward 零中心化并按 horizon 缩放，
+   collision 同时约束 `delta` 与 `excess_over_reference`，RMSD 同时保留 previous 与
+   reference 约束，并启用禁止重复位置修改。这样 terminal mechanical signal 才能
+   在 episode return 中占有可辨认的比例。
+5. **补足状态**：至少加入 remaining-step fraction、visited-position mask 和必要的
+   structure/reward summary，降低非 Markov target 噪声。
+
+总体判断：停止当前 A12 诊断任务并进入 actor scaling 合理，但“更多 actor”只能解决
+墙钟时间，不能解决 reward plateau。下一次完整训练的启动条件应同时包括：A24 等配置
+达到吞吐饱和点、固定验证曲线可用、terminal reward 改为相对初态的力学性能改善信号。
+
+# 2026-08-12：A36 训练效果诊断与下一阶段重点
+
+## 本次判断
+
+A36 已经足以回答 actor scaling 问题：继续增加 actor 的边际收益很低，不再深入做
+系统级加速是合理决策。当前真正的瓶颈不是“收集的数据不够快”，而是 **训练目标、
+观测状态和评价方法尚未对齐到终态力学性能改善**。如果保持现有 reward 继续完成
+64 epochs，最可能得到的是一个更充分拟合“局部少破坏”信号的策略，而不是可靠提高
+strength/toughness 的策略。
+
+本次快照读取：
+
+```text
+A36: async_a36_esm8_f8_g1_20260811_145618
+A12: async_a12_esm8_f8_g1_20260807_111457
+```
+
+A36 分析时包含约 36.4k episodes、874k transitions 和 108.8k optimizer updates。
+两组训练的 F8/G1、batch size 128、24-step horizon、reward scale、target sync 和
+epsilon schedule 相同，因此可在相同 episode/transition 预算下直接比较。
+
+## A36 的速度结论
+
+| 指标 | A12 | A36 | 变化 |
+|---|---:|---:|---:|
+| 全局吞吐 | 8.336 step/s | 9.596 step/s | +15.1% |
+| 平均 actor episode 时间 | 23.55 s | 78.44 s | 3.33x 更慢 |
+| 24 h 完成量 | 约 30k | 35,489 | 小幅增加 |
+| 64 epochs 外推 | 约 15–17 天 | 约 13 天 | 非数量级改善 |
+
+actor 数量增加 3 倍，但吞吐只提升约 15%。单 actor 变慢 3.33 倍，说明 CPU/NUMA、
+内存带宽、PyRosetta、ESM2 请求、IPC 和主进程事件处理已经进入共享资源竞争区间。
+A36 的 actor policy lag 也由 A12 的平均 62.3 updates 增至 67.1 updates。继续增加
+actor 不太可能改变项目周期，因此后续只需保留 A12/A36 结果作为系统容量依据。
+
+## 当前训练效果存在的问题
+
+### 1. terminal mechanical reward 没有改善
+
+相同约 36.4k episodes 下：
+
+| 指标 | A12 | A36 |
+|---|---:|---:|
+| total reward mean | 15.9218 | 15.9039 |
+| 24-step reward sum mean | 16.0013 | 15.9850 |
+| terminal reward mean | -0.0795 | -0.0811 |
+| terminal reward/order correlation | 0.0056 | 0.0052 |
+
+A36 没有比 A12 获得更高的 total reward 或 terminal reward。A36 在 epsilon 已降到
+0.05 后，epoch 1 到 epoch 3 的同一 PDB 配对结果为：
+
+```text
+total reward delta:       +0.00086
+step reward sum delta:    +0.00152
+terminal reward delta:    -0.00066
+improved fraction:        50.69%
+```
+
+该变化远小于 episode 标准差约 1.08，改善比例接近随机的 50%。部分 epoch 4 相对
+epoch 1 的 total reward 反而下降约 0.059。结论不是“增长较慢”，而是当前证据中
+**不存在跨蛋白一致的 terminal mechanical improvement**。
+
+### 2. loss/TD 回落没有形成可靠的价值函数
+
+A36 的峰值相对 A12 略低：Q value peak 141.09 vs 161.13，loss peak 15.59 vs
+18.08；但相同预算下最近 5,000 updates 为：
+
+| 指标 | A12 | A36 |
+|---|---:|---:|
+| loss | 3.5088 | 3.3441 |
+| mean absolute TD error | 3.7813 | 3.6123 |
+| mean Q | 82.26 | 78.35 |
+| mean target Q | 78.94 | 75.18 |
+| grad norm | 10.75 | 10.05 |
+
+数值略有改善，但 mean Q 仍远高于实际未折扣 episode return 约 15.9，且一个随机
+transition 的真实剩余 return 通常比完整 episode return 更低。online Q 与 target Q
+可以一起收敛到高估固定点，因此 loss/TD error 从峰值下降只能证明 Bellman 自洽性
+有所恢复，不能证明 action ranking 正确或策略变好。
+
+### 3. agent 主要优化局部 step reward，而不是力学性能
+
+A36 首尾各 10k transitions 的变化为：
+
+```text
+mean step reward:              0.6151 -> 0.6683
+collision unit score:          0.4489 -> 0.6036
+backbone-H-bond unit score:    0.4912 -> 0.4984
+sidechain-H-bond unit score:   0.4748 -> 0.4935
+local-RMSD unit score:         0.9901 -> 0.9957
+terminal contribution/step:  -0.00419 -> -0.00149
+```
+
+可观察到的提升主要来自 collision 项和本来就接近满分的 previous-step RMSD 项。
+H-bond 项只是趋近无变化对应的 0.5 中性基线，terminal signal 基本没有变化。
+24 个正值 step reward 累积约 16 分，而 terminal reward 只出现一次、均值约 -0.08，
+因此最容易学习的策略是“每一步获得安全分”，不是提高终态预测力学性能。
+
+### 4. reward 可以被局部恢复和循环动作利用
+
+当前默认 collision 只惩罚相对 previous pose 的恶化，RMSD 也主要比较 previous
+pose。A36 后 10k transitions 中：
+
+```text
+collision_excess_over_reference mean = 476.10
+collision_excess_over_reference > 10 = 77.56%
+```
+
+也就是说，即使当前结构仍远差于初始 reference，只要本步比上一步稍有恢复，仍可
+获得很高 step reward。这给“先破坏、再恢复”和来回突变留下了空间。根据相邻序列
+变化恢复出的动作统计：
+
+| 行为 | A12 | A36 |
+|---|---:|---:|
+| 再次修改已访问位置 | 68.27% | 64.29% |
+| 连续修改同一位置 | 59.75% | 54.53% |
+| 两步后回到原序列 | 51.74% | 44.72% |
+
+A36 的多 actor 去相关使循环略有减少，但比例依然很高。当前
+`prevent_revisit_positions=false`，动作空间没有阻止这种 reward exploitation。
+
+### 5. 当前 total reward 不是力学性能改善量
+
+现有 episode 指标是：
+
+```text
+total_reward = sum(step_reward_1 ... step_reward_24) + terminal_absolute_zscore
+```
+
+terminal reward 不是 `property(final)-property(initial)`。命中预测结构时，代码还使用
+按 source PDB stem 找到的静态 predicted structure，它并非 terminal mutated sequence
+的新预测结构，其固定分量会进一步减弱动作与 reward 的因果关系。
+
+### 6. 没有能够判断策略效果的固定验证指标
+
+A12/A36 都配置为 `validate_every=0`、`validation_episodes=0`。目前只有训练期间由
+epsilon-greedy、stale actor policy、不同初始 PDB 产生的 reward 曲线。日志也没有在
+episode summary 中单独保存 initial/final strength、toughness 和二者的 delta。因此，
+即使某些 checkpoint 已经学到局部有效策略，现有曲线也无法可靠识别。
+
+### 7. sequence-only observation 与结构/history reward 不匹配
+
+ESM2 观测主要包含当前序列，但 reward 和可行动作还依赖当前 PyRosetta Pose、初始
+reference、previous pose、visited positions 和 remaining horizon。同一序列可能因
+不同结构历史对应不同 reward/target，当前状态不是充分 Markov 状态。这会提高 TD
+目标方差，并限制 Q head 学习稳定的 action ranking。
+
+## 应该如何解决
+
+### P0：先建立固定、配对的策略验证协议
+
+这是下一步最高优先级，不应先继续完整训练或调 DDQN 超参数。选择固定的 128–256 个
+validation PDB，对 A12/A36 的多个历史 checkpoint 执行 `epsilon=0` greedy evaluation，
+每个 PDB 使用完全相同的初态和 horizon，并保存：
+
+```text
+initial/final strength and delta_strength
+initial/final toughness and delta_toughness
+initial/final terminal score and delta_terminal
+collision excess over reference
+accepted/repeated/reversed actions
+discounted realized return and predicted Q
+```
+
+同时评估 random policy、untrained policy 和简单启发式 policy，报告 paired mean、
+median、improved fraction、top-k enrichment 及 bootstrap 95% CI。先用该验证器检查现有
+checkpoint，才能判断“模型完全没学到”还是“训练 total reward 指标看不出来”。
+
+### P1：将 terminal reward 改为相对初态的 improvement
+
+建议基础形式为：
+
+```text
+terminal_reward = 0.5 * [z(strength_final) - z(strength_initial)]
+                + 0.5 * [z(toughness_final) - z(toughness_initial)]
+```
+
+训练阶段先只使用与动作真正对应的 PyRosetta terminal pose。原始 source sequence 的
+静态 ColabFold 结构不能代表 mutated terminal sequence，不应固定占终态评分 50%。
+ColabFold 可放到离线验证阶段：只对候选 terminal sequences 重新预测结构，用于二次
+确认和不确定性分析。
+
+### P2：重构 step reward 为弱、零中心、难以循环利用的 shaping
+
+step reward 的职责应是约束搜索过程，而不是压过 terminal objective：
+
+1. 将中性变化映射到 0，而不是 0.5；按 horizon 缩放，使 24 步 shaping 总量明显小于
+   或至多接近一个有意义的 terminal improvement。
+2. collision 同时惩罚 `delta_from_previous` 和 `excess_over_reference`；RMSD 同时约束
+   previous 与 reference，避免“先破坏后恢复”得分。
+3. 优先采用 potential-based shaping：`r_shape = gamma * Phi(s') - Phi(s)`，其中
+   `Phi` 是相对 initial reference 定义的结构质量势函数。这样循环轨迹不会持续积累
+   正 reward，也更不容易改变原 terminal objective 的最优策略。
+4. 启用位置访问 mask，基础版本中每个 residue 每 episode 最多修改一次；至少禁止
+   immediate revisit 和 exact reversal。
+
+### P3：补全 Markov state
+
+在 per-residue ESM2 embedding 之外加入：visited-position mask、remaining-step
+fraction、当前位置结构质量摘要，以及 initial-to-current collision/RMSD/H-bond delta。
+若完整结构表征代价过高，先加入这些低维量也能显著减少状态混叠。
+
+### P4：在 reward 对齐后再改价值学习
+
+只有 P0–P3 完成后，才值得继续处理 Q 高估和稀疏 terminal credit：
+
+1. 增加 4/8-step return 或按 episode 采样，提高 terminal signal 向前传播速度。
+2. 对 terminal transitions 做有上限的分层采样，而不是无限放大少量终止样本。
+3. 记录 Q-versus-realized-discounted-return calibration，并按 remaining horizon 分组。
+4. 再比较 learning rate、target sync、policy sync、F/G；这些应是第二层问题，而不是
+   当前最先解决的问题。
+
+## 下一步应该聚焦什么
+
+下一阶段的唯一主问题应表述为：
+
+> **怎样让 agent 在固定未见蛋白上，稳定提高相对初始结构的 predicted strength 和
+> toughness，而不是提高由局部安全分主导的累计 reward？**
+
+建议按以下短周期推进：
+
+1. 用现有 A12/A36 checkpoints 建立固定验证基线，确认是否存在任何隐藏的 terminal
+   improvement；这一步不需要重新训练。
+2. 实现 delta terminal reward、零中心 potential shaping、禁止重复位置和状态补充。
+3. 用小规模固定数据做 5–10k episode 消融：terminal-only、terminal+shaping、是否加入
+   visited/horizon state。以验证集 `delta_strength/delta_toughness` 为主指标。
+4. 只有某个版本在 paired validation 上显著优于 random/untrained baseline，且置信区间
+   不跨 0，才启动更长训练；actor 数量使用 A12 或当前资源下更稳妥的中等配置即可。
+
+最终判断：A36 没有显示出优于 A12 的策略质量，只是以更高资源代价取得有限吞吐和
+轻微数值稳定性改善。当前优先级应从“完成 64 epochs”转为“证明 reward 与力学性能
+改进一致”。在这个问题解决前，更多 epochs 主要增加计算量，不增加结论可信度。
+
+## 2026-08-13：terminal mechanical improvement reward 与 A24 吞吐分析
+
+### 修改目标
+
+本轮先不重构 step shaping，而是完成两个可独立验证的改动：
+
+1. 将结构力学 terminal reward 从终态绝对预测值改为相对同一 episode 初态的改善量；
+2. 保持 strength/toughness 在 terminal objective 内部等权，同时提高 terminal reward
+   相对 24 个 step reward 的整体权重。
+
+### Reward 定义
+
+random forest artifact 中保存的训练集 target mean/std 被用于 z-score。原始 terminal
+improvement 定义为：
+
+```text
+delta_strength_z  = z(strength_final)  - z(strength_initial)
+delta_toughness_z = z(toughness_final) - z(toughness_initial)
+
+raw_terminal_reward = 0.5 * delta_strength_z
+                    + 0.5 * delta_toughness_z
+```
+
+环境最终注入 transition 的 terminal reward 为：
+
+```text
+terminal_reward = terminal_reward_scale * raw_terminal_reward
+```
+
+本轮将 `--terminal-reward-scale` 默认值由 `1.0` 提升为 `8.0`。因此 strength 与
+toughness 的相对比例仍严格为 `1:1`，只是二者合成后的 terminal objective 整体放大
+8 倍。该参数仍可由启动命令覆盖，便于后续做 `1/4/8/16` 消融，而不需要再次修改代码。
+
+### 初态和终态的结构来源
+
+- `initial`：`MechanicalProteinEnv.reset()` 后保存的 `reference_pose`；
+- `final`：相同 episode 最后一步 repack 后的 `current_pose`；
+- 两者使用相同的 hbond/topology feature extractor 和相同 random forest artifact 预测；
+- 当前训练 reward 不再混入按原始 source PDB 文件名找到的静态 ColabFold 结构。
+
+排除静态 ColabFold 结构的原因是：它对应原始序列，而不是 episode 完成 24 次 mutation
+后的 terminal sequence。如果把它固定占 50%，该分量与本 episode 的 action 无关，会
+稀释 credit assignment。对 terminal mutated sequence 重新运行 ColabFold 仍适合放在
+离线候选验证阶段，但不适合直接阻塞当前在线 actor。
+
+### 代码修改
+
+1. `model/reward_module/terminal_reward/calculator.py`
+   - 新增 `MechanicalImprovementTerminalRewardCalculator`；
+   - 新增包含 initial/final prediction、两项 z-score delta 和 reward components 的结果类；
+   - 保留旧 dual-structure calculator 作为离线评估/兼容 API，不再作为默认训练 reward。
+2. `model/environment_module/environment.py`
+   - episode finalize 时同时传入 `reference_pose` 和 `current_pose`；
+   - 环境层继续统一应用 `terminal_reward_scale`。
+3. `training.py` 与 `model/asynchronous_module/runtime.py`
+   - 串行和异步 actor 都改用 improvement calculator；
+   - 默认 scale 设为 `8.0`，并增加 finite/non-negative 参数检查；
+   - 保留 `--terminal-predicted-pdb-dir` 仅用于旧命令行兼容，默认训练路径不再使用它。
+4. `train_version_terminal_async.sh`
+   - 新增环境变量 `MPRL_TERMINAL_REWARD_SCALE`，默认 `8.0`；
+   - 启动目录名称记录 `terminalx<scale>`，防止不同 reward 实验混淆；
+   - 启动命令显式传递 `--terminal-reward-scale`。
+5. `model/logging_module/training_logger.py`
+   - episode JSONL/CSV 与 TensorBoard 新增 initial/final strength、toughness；
+   - 新增 `mechanical_delta_strength_z` 和 `mechanical_delta_toughness_z`；
+   - 后续判断训练效果应优先观察两项 delta，而不是只观察 total reward。
+
+### Scale 8 的小样本依据
+
+使用真实 PyRosetta pose 做了两层 smoke test：
+
+1. 单个 PDB、单次 mutation 的完整环境路径可以正常计算 initial/final reward。该样本的
+   7 个 RF feature 恰好没有改变，因此 delta 为 0。这不是代码错误，而是当前 7-feature
+   predictor 对某些单点侧链变化不敏感的直接表现。
+2. 对 8 个真实 PDB 分别执行 24 次随机 mutation/repack，8/8 都得到非零 delta。raw
+   terminal reward 范围约为 `[-0.1964, 0.1838]`；scale 8 后约为
+   `[-1.5711, 1.4708]`。
+
+当前旧训练中 24 个 step reward 合计通常约 16。scale 8 已经使 terminal signal 从原先
+约 `0.1` 量级提升到可检测的 `1` 量级，但还没有一次性压过全部 step shaping，因此可作
+为“先调整权重”的保守基线。是否还需要提高，应由固定验证集上的两项 mechanical delta
+决定，而不是仅凭训练 total reward 决定。
+
+### 测试结果
+
+```text
+targeted tests:
+39 passed in 4.27s
+
+full repository tests:
+120 passed, 2 skipped in 9.16s
+
+bash -n train_version_terminal_async.sh: passed
+git diff --check: passed
+```
+
+PyRosetta smoke 中仍观察到 artifact 由 scikit-learn `1.6.1` 训练、当前环境为 `1.7.2`
+的 `InconsistentVersionWarning`。本轮预测可运行且输出有限值，但正式长训练前最好在当前
+环境重新导出 artifact，或将运行环境固定为 `scikit-learn==1.6.1`，消除序列化兼容风险。
+
+### A24 速度分析
+
+分析日志：
+
+```text
+/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/
+async_a24_esm8_f8_g1_20260812_162817/train_stdout.log
+```
+
+为排除启动、数据清洗和尾部停止时间的影响，A12/A24/A36 都使用相同的
+`global_step=50,000 -> 750,000` 区间比较：
+
+| actors | environment steps/s | episodes/day（24 steps） | 492,864 episodes 预计耗时 |
+|---:|---:|---:|---:|
+| 12 | 8.1613 | 29,381 | 16.78 days |
+| 24 | 9.6780 | 34,841 | 14.15 days |
+| 36 | 9.5636 | 34,429 | 14.32 days |
+
+A24 相对 A12 吞吐提高 `18.58%`；A24 相对 A36 还高 `1.20%`，同时少使用 12 个 actor。
+所以在当前服务器、3 个 ESM inference worker 和一个 learner 的配置下，A24 是三者中
+更合理的资源/吞吐折中点。
+
+actor 自身 episode elapsed 也显示出明显资源竞争：
+
+| actors | mean episode sec | median | p90 |
+|---:|---:|---:|---:|
+| 12 | 23.22 | 22.36 | 30.60 |
+| 24 | 48.72 | 47.12 | 59.73 |
+| 36 | 78.41 | 75.47 | 95.83 |
+
+从 A12 到 A24，actor 数量翻倍，但单 actor episode 延迟也约翻倍；A36 延迟继续增加。
+说明 PyRosetta CPU/内存带宽、ESM inference queue 或进程调度已经饱和，增加 actor 主要
+增加并发等待，而不是产生线性吞吐。A24 当前日志在约 22.4 小时完成 32,641 episodes；
+因为尚未达到完整 24 小时，表中的 34,841/day 是稳态区间外推，不把它误写为完整一天
+的实测值。
+
+### 重要运行说明与下一步判断
+
+当前正在运行的 `async_a24_esm8_f8_g1_20260812_162817` 在本次代码修改前启动，所以它
+仍使用旧的绝对 terminal reward 和 scale 1；运行中的 Python 进程不会自动加载新代码。
+该 run 仍可作为 A24 速度基线，但不能用来评价新的 mechanical improvement reward。
+
+下一次新启动的 run 才会使用 delta reward 和 scale 8。建议先做短周期对照，并以
+`mechanical_delta_strength_z`、`mechanical_delta_toughness_z`、二者 improved fraction
+及固定 validation PDB 的 paired delta 为主要判据。如果 scale 8 仍无法产生可检测改善，
+再进入已提出的 step reward 零中心化/potential shaping 重构，而不是继续只提高 actor
+数量或盲目延长训练。
+
+## 2026-08-13：DDQN Q-value 高估的原因、诊断与解决顺序
+
+### 首先区分“Q 很大”和“Q 高估”
+
+Q-value 的定义是从当前 transition 开始的期望折扣回报：
+
+```text
+Q(s_t, a_t) = E[r_t + gamma*r_(t+1) + gamma^2*r_(t+2) + ...]
+```
+
+因此 Q 数值大本身不能直接证明高估。正确的诊断对象不是完整 episode total reward，
+而是同一个 `(s_t, a_t)` 对应的实际 discounted return：
+
+```text
+G_t = r_t + gamma*r_(t+1) + ... + gamma^(T-t)*r_T
+calibration_error = Q(s_t, a_t) - G_t
+```
+
+不过当前成熟 run 中 online Q 约为 `79-81`、target Q 约为 `75-78`，而一个完整 episode
+的未折扣 total reward 通常只有 `15-16`。随机抽到的中间 transition 所剩余的真实 return
+还会更小，所以当前 Q-value 仍然高度可疑。DDQN 只能缓解标准 DQN 中由同一网络同时
+选择和评估最大动作造成的统计高估，不能消除 reward、状态、数据和 bootstrapping 带来
+的其他系统性偏差。
+
+### 可能原因与对应方案
+
+| 原因 | 当前项目中的具体风险 | 对应解决方案 |
+|---|---|---|
+| Step reward 长期为正 | 无明显改善也可能获得约 `0.5` 的中性分，24 步持续积累正 reward | 将 step reward 零中心化；无改善为 0、恶化为负；降低 step reward scale |
+| Reward exploitation | 重复修改、先破坏再恢复也可能持续获得相对 previous pose 的局部分数 | 禁止重复位置和立即反向突变；使用相对 initial reference 的 potential-based shaping |
+| 状态不含剩余步数 | 同一序列在第 1 步和第 23 步的未来 return 不同，但网络无法区分 | 加入 `remaining_steps / max_steps` |
+| 状态缺少结构和历史 | ESM2 主要表示序列，而 reward 还依赖 Pose、reference、visited positions | 加入 visited mask、collision/H-bond/RMSD 相对初态的结构摘要 |
+| Bootstrapping 误差传播 | 偏高的 target Q 通过 `r + gamma*Q_target` 反复向前传播 | 使用 4/8-step return；适度降低 gamma；对异常 TD target 做有依据的范围监控/裁剪 |
+| Online/target 误差相关 | target 定期完整复制 online，两个网络并不真正独立 | 比较 soft/Polyak update；进一步可测试双 critic、ensemble 或 clipped/min-Q |
+| Hard sync 阶梯效应 | 早期同步后 loss/TD error 会显著跳升 | 比较 `N=63/125/250`；或使用 `tau=0.005-0.01` 的 soft update |
+| Update-to-data ratio 不合适 | 相同 replay 数据被过度复用，有限行为分布上的误差被放大 | 调整 F/G、降低 UTD；提高数据多样性；按相同 environment steps 对比 |
+| 异步策略陈旧 | replay 同时包含不同 actor policy version 的 transition | 缩短 actor policy sync；记录 policy age；过滤或降低过旧 transition 的权重 |
+| 未覆盖动作的外推高估 | 巨大突变动作空间中，少采样动作也可能被网络预测为高 Q 并被 argmax 选中 | 更均衡探索；ensemble uncertainty；conservative Q regularization |
+| Terminal reward 稀疏 | 力学 improvement 只在最后一步出现，很难影响前面的动作 | n-step return；有上限的 terminal/episode-aware sampling |
+| 力学预测器噪声 | RF 对部分突变不敏感，对另一些结构特征变化可能跳变 | 记录预测不确定性；限制异常 delta；对候选结构进行重复或离线验证 |
+| 学习率或梯度过大 | Online Q 快速追逐不断移动的 bootstrap target | 测试 `1e-4 -> 5e-5`；保留 Huber loss 和 gradient clipping |
+| 表征/网络泛化误差 | 共享 per-residue head 需要覆盖大量异质蛋白和变长动作空间 | 加入 LayerNorm/正则化/ensemble，并补充结构条件输入 |
+
+### 当前终止状态处理检查
+
+Replay Buffer 当前使用：
+
+```text
+done = terminated or truncated
+```
+
+TD target 使用：
+
+```text
+target = reward + gamma * (not done) * next_q_target
+```
+
+当前 `max_steps=24` 是任务定义的有限 horizon；最后一步产生 terminal reward，并停止
+继续 bootstrap，因此把该 truncated transition 当作 done 是合理的。若以后 truncated
+仅表示外部时间限制、任务本身仍可继续，则应区分 terminated 和 time-limit truncation；
+但当前实现暂时不像 Q 高估的主要来源。
+
+### Target network 同步频率的角色
+
+当前异步设置 `F=8, G=1, target_sync_interval=125`，即每约 1000 个 environment
+transitions 硬同步一次。日志表明：
+
+- 前 2k optimizer updates，同步后 TD error 可增加约 `90%-120%`；
+- 2k-5k updates 降为约 `30%-40%`；
+- 5k-10k updates 降为约 `9%-17%`；
+- 10k updates 以后通常只有约 `0%-2%`。
+
+所以 hard sync 是早期阶梯增长的影响因素，但没有证据表明 `N=125` 在成熟阶段持续
+制造发散。历史 `F8/G1, N=63` run 的单次同步跳变反而比 `N=125` 小，说明硬同步间隔
+越长，online-target 参数差可能积累得越大，然后一次性释放。不能简单认为“同步越频繁
+越不稳定”或“同步越少越稳定”。
+
+更重要的是，online Q 与 target Q 可以一起收敛到错误的高估固定点。两条 Q 曲线彼此
+接近、loss 下降，只能说明 Bellman 自洽性改善，不能证明 Q 接近真实 return，也不能
+证明策略提高了 strength/toughness。
+
+### 建议的解决优先级
+
+#### P0：建立 Q-versus-return calibration
+
+对完整 episode 反向计算每个 transition 的 `G_t`，保存：
+
+```text
+predicted_q
+realized_discounted_return
+q_minus_return
+remaining_steps
+terminal/non-terminal
+actor_policy_age
+```
+
+按 remaining horizon、PDB、训练阶段和 terminal proximity 分组，报告 calibration bias、
+MAE、RMSE 和散点图。这是确认“高估多少、从哪里开始高估”的必要步骤。
+
+#### P1：补全 Markov state
+
+至少加入：
+
+```text
+remaining_step_fraction
+visited_position_mask
+collision_excess_over_initial
+hbond_delta_from_initial
+rmsd_from_initial
+```
+
+否则相同 ESM2 sequence embedding 可能对应不同 remaining horizon、结构历史和可行动作，
+网络被迫用一个 Q 值拟合多个真实 return。
+
+#### P2：使 step shaping 零中心并限制循环利用
+
+将无变化对应的 reward 设为 0，恶化为负，改善为正；step shaping 的 episode 总幅度应
+明显小于或至多接近有意义的 terminal mechanical improvement。优先采用：
+
+```text
+r_shape = gamma * Phi(s_next) - Phi(s)
+```
+
+其中 `Phi` 相对 initial structure 定义。这样循环回到原状态不会持续产生正收益。
+
+#### P3：使用 n-step return
+
+建议先测试 `n=4` 和 `n=8`：
+
+```text
+target_n = r_t + gamma*r_(t+1) + ...
+         + gamma^(n-1)*r_(t+n-1)
+         + gamma^n*Q_target(s_(t+n))
+```
+
+它可以减少反复 bootstrap 的次数，并让 terminal mechanical reward 更快传播到前面的
+mutation action。
+
+#### P4：再比较 target update 和优化超参数
+
+在前述问题处理或至少具备 calibration 指标以后，再做相同数据、相同 environment steps
+的消融：
+
+```text
+hard sync N = 63 / 125 / 250
+soft update tau = 0.005 / 0.01
+learning rate = 1e-4 / 5e-5
+```
+
+主要判据应是 Q-return calibration 和固定验证集的 `delta_strength/delta_toughness`，
+loss/TD error 仅作为数值稳定性指标。
+
+### 最终判断
+
+当前 Q 高估更可能由“持续正 step reward + 非充分状态 + bootstrapping + reward exploitation”
+共同导致，而不是由单一 target-sync interval 导致。推荐执行顺序为：
+
+```text
+Q-return calibration
+-> horizon/history/structure state
+-> step reward zero-centering and potential shaping
+-> n-step return
+-> soft target update
+-> learning rate and F/G tuning
+```
+
+最终目标不是让 online Q 和 target Q 相互接近，而是让两者同时接近真实 discounted return，
+并让 greedy policy 在固定未见蛋白上产生可重复的正 `delta_strength` 和
+`delta_toughness`。
+
+## 2026-08-14：terminal×8 结果分析与 PER、零中心 shaping、3-step return
+
+### 分析对象
+
+新 terminal reward run：
+
+```text
+/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/
+async_a24_esm8_f8_g1_terminalx8.0_20260813_150454/
+```
+
+对照 run：
+
+```text
+/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/
+async_a24_esm8_f8_g1_20260812_162817/
+```
+
+两个 run 都使用 A24、ESM batch 8、F8/G1、batch size 128、horizon 24 和
+`target_sync_interval=125`。主要差异是旧 run 使用绝对 terminal reward、scale 1；新 run
+使用 final-minus-initial mechanical delta、scale 8。因此可在相同 optimizer update 区间
+比较数值收敛形态，但异步采样仍不是完全确定性的配对实验。
+
+### 模型收敛分析
+
+#### 1. 修改 terminal reward 没有改变基本的“先升后降”形态
+
+| optimizer 区间 | run | loss | mean abs TD | grad norm | mean Q | mean target Q |
+|---|---|---:|---:|---:|---:|---:|
+| 0-2k | old | 0.382 | 0.634 | 1.921 | 7.72 | 7.53 |
+| 0-2k | delta×8 | 0.408 | 0.664 | 1.973 | 7.73 | 7.53 |
+| 5k-10k | old | 6.534 | 6.983 | 19.749 | 109.35 | 105.59 |
+| 5k-10k | delta×8 | 8.107 | 8.566 | 21.626 | 127.06 | 122.71 |
+| 10k-20k | old | 6.469 | 6.855 | 20.807 | 136.60 | 131.18 |
+| 10k-20k | delta×8 | 7.160 | 7.558 | 22.868 | 148.67 | 142.75 |
+| recent 10k | old | 3.370 | 3.639 | 10.232 | 79.41 | 76.22 |
+| recent 10k | delta×8 | 3.266 | 3.537 | 10.319 | 76.40 | 73.32 |
+
+两者都经历 Q/loss/TD/gradient 先快速升高、再逐渐下降。delta×8 在 5k-10k 阶段的
+loss 和 TD error 分别比旧 run 高约 24% 和 23%，Q 峰值也更高。这说明放大一次性的
+terminal delta 增加了早期 target variance，却没有改变由正 step reward 和 bootstrapping
+主导的整体动力学。进入较晚阶段后，两者几乎回到相同数值范围；数值上能够收敛，但这
+只说明 learner 再次达到 Bellman 自洽，并不说明策略学会力学性能改善。
+
+#### 2. Target hard sync 不是两条曲线相似的唯一原因
+
+新旧 run 都使用相同 `N=125`，早期同步后均有明显 TD 阶梯，10k updates 后同步边界
+影响降至约 0%-2%。terminal×8 没有消除该现象，也没有造成长期新增发散。因此当前
+“训练形态没有区别”主要说明 terminal transition 在 uniform one-step replay 中占比和
+传播能力仍不足，而不是 terminal reward 代码没有生效。
+
+### 训练效果分析
+
+#### 1. Episode total reward 的早期增长依旧来自正 step reward
+
+```text
+old run recent mean step reward:       0.6668
+delta×8 recent mean step reward:       0.6592
+delta×8 recent terminal/transition:   -0.0094
+```
+
+24 个约 0.66 的 step reward 可以贡献约 15.8，而 terminal reward 每 episode 只出现一次。
+即使 terminal scale 提高到 8，它仍被旧的正向 shaping 基线和 one-step uniform sampling
+稀释。TensorBoard 中 episode total reward 先升后平台，不能视为力学性能增长。
+
+#### 2. Strength 没有学习趋势，toughness 仍为负改善
+
+delta×8 run 按每 2000 episodes 分块：
+
+```text
+episodes 0-2000:
+  delta_strength_z  = -0.0037, positive = 51.0%
+  delta_toughness_z = -0.1046, positive = 26.3%
+  terminal_reward   = -0.4331
+
+episodes 2000-4000:
+  delta_strength_z  = -0.0050, positive = 48.8%
+  delta_toughness_z = -0.0577, positive = 33.4%
+  terminal_reward   = -0.2507
+
+episodes 24000-26000:
+  delta_strength_z  = -0.0045, positive = 48.3%
+  delta_toughness_z = -0.0506, positive = 34.8%
+  terminal_reward   = -0.2203
+```
+
+toughness 的恶化程度在探索早期有所减小，但约 4000 episodes 后主要在负值附近平台；
+strength 始终接近随机正负各半，没有稳定正趋势。此时 epsilon 已接近下限，后续平台更能
+代表当前 greedy/near-greedy policy 的效果。结论是：terminal reward 修改已生效，但
+uniform one-step learner 没有把该信号可靠传播到前面的 mutation action。
+
+### 实现 1：Ape-X 风格 TD-error prioritized replay
+
+#### 采样与更新公式
+
+新 replay 模式使用 learner 计算的 n-step TD error：
+
+```text
+priority_i = abs(td_error_i) + priority_epsilon
+P(i) = priority_i^alpha / sum_j(priority_j^alpha)
+w_i = (N * P(i))^(-beta)
+w_i <- w_i / max_batch(w)
+```
+
+逐样本 Huber loss 乘以 `w_i` 后再求 batch mean。每次 optimizer update 完成后，learner
+将最新绝对 TD error 回写到对应 replay index。新 transition 使用当前最大 priority，
+保证至少能尽快被 learner 看见一次。beta 从 start 线性退火到 1，以逐步修正 prioritized
+sampling 引入的分布偏差。
+
+新增参数：
+
+```text
+--replay-sampling {uniform,prioritized}  # CLI 默认 uniform
+--priority-alpha 0.6
+--priority-beta-start 0.4
+--priority-beta-end 1.0
+--priority-beta-steps 1000000
+--priority-epsilon 1e-6
+```
+
+`uniform` 模式使用全 1 importance weights，与旧 loss 路径数值等价。Replay snapshot
+format 升级到 v2，保存 priority、n_steps、beta 配置和 RNG；v1 snapshot 可作为 uniform、
+one-step replay 兼容加载。
+
+本实现准确地采用 Ape-X 的 TD-error priority、central replay 和 importance weighting，
+但初始 priority 由“当前最大 priority”提供，第一次 learner update 后才变为真实 TD error。
+原因是当前 CPU actor 只持有 online policy，没有 target network；让 actor 额外计算 DDQN
+TD error 会增加模型同步和 CPU 开销。对于当前集中式 learner，这是更稳妥的 Ape-X-style
+实现，而不是宣称复现论文的全部分布式系统细节。
+
+### 实现 2：零中心、弱 step shaping
+
+原诊断 unit score 继续保留在 0-1，便于与历史 TensorBoard 对比；用于训练的标量改为：
+
+```text
+centered_collision = collision_unit_score - 1
+centered_rmsd      = rmsd_unit_score - 1
+centered_hbond     = 2 * hbond_unit_score - 1
+
+step_reward_raw = weighted_mean(centered components)
+```
+
+因此：
+
+- collision/RMSD 无惩罚为 0，恶化为负；
+- H-bond 无变化为 0，增加为正、减少为负；
+- “没有变坏”不再持续产生正 reward。
+
+`--step-reward-scale` 默认及异步脚本设置为 `0.025`。centered weighted mean 的绝对值
+不超过 1，所以 24 个合法 action 的 shaping 理论绝对上限约为：
+
+```text
+24 * 0.025 = 0.6
+```
+
+这低于 pilot 中 scale 8 后约 `1` 量级的有意义 terminal mechanical improvement。非法
+action/update error 的显式 penalty 不属于 shaping bound；action mask 应使非法 action
+极少进入正常策略路径。
+
+### 实现 3：可配置 n-step return
+
+新增参数：
+
+```text
+--n-step N  # CLI 默认 1，异步训练脚本设置 3
+```
+
+中央收集端为每个 actor 独立维护 episode-local queue：
+
+```text
+R_t^(n) = r_t + gamma*r_(t+1) + ... + gamma^(n-1)*r_(t+n-1)
+target  = R_t^(n) + gamma^n * (not done) * Q_target(s_(t+n), a*)
+```
+
+episode 终止时 flush 剩余前缀，因此 `n=3` 的最后三个 replay row 分别具有实际
+`n_steps=3/2/1`。terminal mechanical reward 会进入最后三个 mutation action 的 return，
+不再只监督最后一个 action。Optimizer 调度仍按真实 environment transitions 计数，不按
+一次 terminal flush 产生的 replay row 数计数。
+
+PER 的 priority 使用上述 n-step target 对应的 TD error，所以两项功能在数学上保持一致。
+
+### 修改文件
+
+```text
+model/replay_buffer_module/replay_buffer.py
+model/replay_buffer_module/n_step.py
+model/replay_buffer_module/__init__.py
+model/agent_module/ddqn_agent.py
+model/reward_module/reward_calculators.py
+training.py
+asynchronous_training.py
+train_version_terminal_async.sh
+tests/test_n_step.py
+tests/test_replay_buffer.py
+tests/test_ddqn_agent.py
+tests/test_reward_calculators.py
+tests/test_training_multi_gpu.py
+```
+
+Optimization JSONL/TensorBoard 还会自动记录：
+
+```text
+mean_importance_weight
+mean_sampling_probability
+priority_beta
+mean_n_steps
+```
+
+### 启动配置
+
+`train_version_terminal_async.sh` 当前默认实验配置为：
+
+```text
+actors=24
+F=8, G=1
+replay_sampling=prioritized
+priority_alpha=0.6
+priority_beta=0.4 -> 1.0
+n_step=3
+step_reward_scale=0.025
+terminal_reward_scale=8.0
+```
+
+可通过以下环境变量做消融：
+
+```bash
+MPRL_REPLAY_SAMPLING=uniform
+MPRL_N_STEP=1
+MPRL_STEP_REWARD_SCALE=0.025
+MPRL_TERMINAL_REWARD_SCALE=8.0
+```
+
+新的 reward/replay 语义与旧 replay 数据不一致，正式实验应从新 replay 开始，不应把旧的
+正基线 one-step replay 恢复到新 run 中。
+
+### 测试结果
+
+```text
+PER/n-step/reward/agent/asynchronous targeted tests:
+85 passed, 2 skipped
+
+PyRosetta environment/reward smoke:
+6 passed
+
+full repository:
+130 passed, 2 skipped in 9.60s
+
+bash -n train_version_terminal_async.sh:
+passed
+
+git diff --check:
+passed
+```
+
+组合 learner smoke 使用两个变长短 episode，经过 n=3 聚合和 prioritized replay 执行真实
+DDQN update：
+
+```text
+replay_size=8
+loss=0.166277
+mean_abs_td=0.561478
+mean_n_steps=2.25
+priority_beta=0.4000048
+priorities_changed=6
+finite=true
+```
+
+`mean_n_steps=2.25` 正确反映每个四步 episode 的 `3/3/2/1` 聚合；priority changed 少于
+8 是因为 prioritized sampling with replacement 允许同一 index 在 batch 中重复。
+
+### 下一轮训练的判断标准
+
+PER 会优先学习当前 TD error 大的 transition，但“大 TD error”不必然等于“有益的力学
+样本”；它也可能来自 noisy/outlier reward。因此下一轮不能只期待 loss 更快下降，应同时
+检查：
+
+1. `mechanical_delta_strength_z` 和 `mechanical_delta_toughness_z` 的 rolling mean；
+2. 两项分别和同时为正的 improved fraction；
+3. terminal reward 在 priority 分布和 sampled batch 中的占比；
+4. Q-versus-realized n-step/episode return calibration；
+5. priority p50/p90/p99，防止少量异常结构长期垄断 replay；
+6. 与 `uniform+n1`、`uniform+n3`、`prioritized+n1` 的短周期消融。
+
+本轮修改直接处理了三个已确认的问题：重要 transition 利用不足、step reward 正基线、
+terminal credit 传播过慢。它们比继续单独增大 terminal scale 更有针对性；但是否真正提高
+未见蛋白的 strength/toughness，仍必须由固定 validation PDB 的配对 mechanical delta
+验证，而不能由训练 episode total reward 或 loss 单独判断。
+
+## 2026-08-17：PER + 3-step + zero-centered shaping 训练结果分析
+
+### 分析对象与对齐方式
+
+对比日志：
+
+- 上一版本：`async_a24_esm8_f8_g1_terminalx8.0_20260813_150454`；
+- 当前版本：`async_a24_esm8_f8_g1_prioritized_n3_stepx0.025_terminalx8.0_20260814_103321`。
+
+上一版本在 `659,512` environment transitions、`27,464` episodes 后停止；当前版本在本次
+分析快照时已到约 `1,682,000` transitions、`70,081` episodes，即约 `9.1` 个完整 epoch。
+优化器指标首先在两者共同拥有的 `4,096--659,000` transition 区间比较，共约 `81.9k`
+次 optimizer updates；策略效果同时按 epoch 聚合，并按 `source_pdb` 做跨 epoch 配对，减少
+不同蛋白难度差异造成的混淆。
+
+### 数值收敛对比
+
+共同训练区间的统计如下。括号中的 p99 比单个偶发最大值更适合表示典型峰值。
+
+| 指标 | 上一版本 mean / p99 / max | 当前版本 mean / p99 / max |
+| --- | ---: | ---: |
+| loss | 4.485 / 12.129 / 19.906 | 0.175 / 1.722 / 2.655 |
+| mean absolute TD error | 4.807 / 12.558 / 20.328 | 1.047 / 6.752 / 8.675 |
+| grad norm | 14.233 / 38.130 / 67.954 | 0.346 / 2.128 / 4.006 |
+| mean Q | 96.688 / 159.674 / 165.418 | 1.981 / 14.743 / 16.505 |
+| mean target Q | 92.869 / 154.448 / 162.868 | 1.351 / 10.378 / 12.805 |
+
+因此，新版本确实显著降低了 Q、loss、TD error 和 gradient 的峰值与方差，也没有再出现
+先前接近数值发散的轨迹。PER、3-step return 和 reward 重标定后的 Bellman 回归稳定性明显
+更好。
+
+但不能把全部降幅都解释为“策略学得更好”：上一版本每步 reward 存在约 `+0.66` 的正
+基线，而当前 step shaping 被零中心化并乘以 `0.025`。reward 单位改变会直接缩小 Q、target
+和 loss。此外，PER loss 乘了 importance-sampling weight；当前后期 beta 已达到 `1.0`，
+mean importance weight 约 `0.126`，所以加权 loss 很小并不等于未加权 TD error 已消失。
+在 `1.30M--1.68M` transitions，loss mean 约 `0.0050`，但未加权 mean absolute TD error
+仍约 `0.380`。
+
+当前后期 mean Q 约 `0.321`、mean target Q 约 `0.147`，而实际 episode total reward 和
+terminal reward 的均值仍为负。由于 Q 是最优动作的期望回报，不能直接用两者均值证明
+高估，但这至少说明仍需做 `Q(s,a)` 与相同 transition 的 realized discounted return 校准；
+不能仅凭 Q 的绝对值从 150 降到 10 以下就断言高估已经完全解决。
+
+### 力学优化效果
+
+当前版本按完整 epoch 聚合的结果如下：
+
+| epoch | total reward | terminal reward | delta strength z | delta toughness z | epsilon mean |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | -0.488 | -0.396 | -0.0061 | -0.0930 | 0.177 |
+| 3 | -0.429 | -0.341 | -0.0052 | -0.0801 | 0.050 |
+| 5 | -0.379 | -0.292 | -0.0040 | -0.0691 | 0.050 |
+| 7 | -0.326 | -0.241 | -0.0039 | -0.0563 | 0.050 |
+| 9 | -0.302 | -0.219 | -0.0050 | -0.0498 | 0.050 |
+
+曲线肉眼看起来近似水平，但按相同 PDB 配对后可以检测到弱改善。第 9 epoch 相对第 1
+epoch：
+
+- terminal reward 平均增加 `+0.1776`，中位数增加 `+0.1362`；`60.0%` 的 PDB 有改善；
+- delta toughness z 平均增加 `+0.0432`，`61.5%` 的 PDB 有改善；
+- delta strength z 只增加 `+0.0012`，改善比例 `51.0%`，接近随机波动；
+- terminal reward 为正的 episode 比例由第 1 epoch 的 `31.5%` 增至第 9 epoch 的
+  `40.5%`，但多数 episode 仍使预测力学性能下降。
+
+所以当前版本不是“完全没有学习”，而是主要学会了**减轻 toughness 恶化**，还没有学会
+稳定地产生正向 toughness improvement，更没有学会提高 strength。total reward 与 terminal
+reward 的 epoch 内相关系数约 `0.999`，平均累计 shaping 只有约 `-0.08~-0.09`；这说明
+step reward 已不再掩盖 terminal objective，total reward 不增长的核心问题已经转移到策略、
+状态表示、探索和 terminal signal 本身。
+
+在相同的前三个 epoch 内，上一版本 terminal reward 从 `-0.282` 变为 `-0.238`，当前版本
+从 `-0.396` 变为 `-0.341`。按相同 PDB 配对，第 3 epoch 相对第 1 epoch 的 terminal 提升
+分别为 `+0.044` 和 `+0.055`，幅度相近。也就是说，新方案明显提高了数值稳定性，但目前
+没有证据表明它在相同样本预算内显著提高了力学优化效率；当前版本较长训练后的改善主要
+来自持续训练，而不是前三个 epoch 就表现出更强的策略。
+
+### 当前主要问题
+
+1. **缺少固定 greedy validation。** 训练 episode 同时改变策略、epsilon、PDB 顺序和
+   replay 分布。训练曲线只能说明数据收集时的表现，不能可靠评价 checkpoint 的策略提升。
+   应在固定 validation PDB 上用 `epsilon=0`、相同 seed 做配对评估，记录 strength/toughness
+   mean、median、positive fraction、top-k 和 bootstrap confidence interval。
+2. **strength reward 几乎没有可学习变化。** strength delta 长期约为 `-0.004~-0.006`，
+   正向概率约 50%。可能是 24 次局部突变和 repack 很少改变 RF 所依赖的全局 topology
+   features，也可能是 RF 的分段常数输出使局部变化得到近似零信号。应先统计 terminal
+   strength delta 的零值比例、唯一值数量、分位数和单步/多步敏感性，再判断 RL 是否有
+   足够的 strength 学习信号。
+3. **PER 优先“大 TD error”，不等于优先“正向力学样本”。** 负向 terminal outlier 同样
+   会被高频采样，因此当前行为更像学习避免严重 toughness 下降。应记录 positive/negative
+   terminal transitions 在 replay、priority top 1% 和 sampled batch 中的占比；必要时采用
+   terminal-aware stratified replay，同时保留 TD-error priority 和 IS correction。
+4. **n=3 对 24-step horizon 仍然较短。** terminal reward 只直接进入最后三个动作的 target，
+   更早动作仍依赖多轮 bootstrapping。可以做 `n=3/6/12` 消融，或为 terminal episode 使用
+   backward episodic return；不能只通过继续增大 terminal scale 解决 credit assignment。
+5. **观测与结构 reward 不完全 Markov。** Q network 看到的是当前序列的 ESM2 embedding，
+   但 terminal predictor 使用当前 PyRosetta 结构的氢键/topology。相同序列可能因突变顺序和
+   局部 repack 得到不同结构，且观测没有剩余步数、已访问位置、初始机械属性或当前结构
+   特征。建议加入 normalized remaining steps、visited-position mask、initial/current mechanical
+   proxies；中长期可让 Q head 融合便宜的结构图或氢键摘要。
+6. **动作循环仍然允许。** 当前 `prevent_revisit_positions=false`，虽然当前氨基酸的 no-op
+   被 mask，策略仍可执行 `A -> B -> A`。零中心 shaping 降低了循环收益，却没有禁止循环。
+   下一次消融应开启 `--prevent-revisit-positions`，并确保 visited mask 进入 observation。
+7. **replay 覆盖不足一个 epoch。** capacity `50,000` 只对应约 `2,083` 个完整 episode，
+   约为 7,701 个训练蛋白的 27%。对高度异质的变长蛋白，PER 还会进一步压缩有效覆盖。
+   需要监控 priority entropy/effective sample size；若内存不允许直接扩大，可按蛋白或 reward
+   符号分层保留 terminal transitions。
+8. **reward artifact 存在版本告警。** 日志显示 RF 由 scikit-learn `1.6.1` 保存，却在
+   `1.7.2` 中加载。它未必造成当前趋势，但会削弱 reward 的可复现性，应使用与训练 artifact
+   相同的 sklearn 版本，或在当前环境重新训练并重新验证模型。
+
+### Epsilon 衰减分析
+
+当前实现按**全局 environment transition**线性计算：
+
+```text
+progress = min(global_environment_steps / epsilon_decay_steps, 1)
+epsilon = 1.0 + progress * (0.05 - 1.0)
+```
+
+配置是 `epsilon_decay_steps=50,000`。因此 epsilon 在约 `50,000 / 24 = 2,083` episodes
+后达到 `0.05`，仅为 `2,083 / 7,701 = 0.27 epoch`。TensorBoard 若按 episode 或记录序号
+显示，会造成“5k 多 steps 才触底”的视觉差异，但从代码和日志看，第二个 epoch 开始前
+epsilon 已经固定为 `0.05`。24 个 actor 不应再乘入公式，因为 central global step 已经是
+所有 actor transition 的总和；`train_batch_size` 也不应乘入，因为每个 PDB 本身就是一个
+episode。
+
+如果目标是用前 4 个 epoch 做线性大范围探索，用户提出的数量级是合理的，但公式中的 `4`
+应解释为 4 个 epoch：
+
+```text
+epsilon_decay_steps = 7701 proteins * 4 epochs * 24 steps = 739,296
+```
+
+采用当前单段线性公式时，epsilon 在第 1/2/3/4 epoch 末约为
+`0.7625 / 0.5250 / 0.2875 / 0.0500`。因此下一轮最小改动可设置：
+
+```bash
+--epsilon-decay-steps 739296
+```
+
+这个修改明显比当前 50k 合理，但“衰减 4 个 epoch”和“前几个 epoch 始终保持高探索”并不
+完全相同。更推荐后续增加分段 schedule：先用约 1 epoch 保持较高 epsilon，再在 3--7 个
+epoch 内下降到 `0.1`，最后缓慢降到 `0.05`。对于异步 Ape-X 风格采集，还可以让不同 actor
+长期使用不同 epsilon：一部分 actor 保持探索，一部分 actor 负责利用，避免所有 24 个 actor
+在 0.27 epoch 后同时退化为近乎 greedy。
+
+epsilon 也不能无限拉长。当前随机突变大多产生负 terminal reward，过高 epsilon 会持续向
+PER 注入高优先级失败样本。因此应比较 `50k`、`739,296` 和分层 actor epsilon，并统一用
+固定 greedy validation 判断，而不是选择训练 total reward 最好看的 schedule。
+
+### 建议的下一步顺序
+
+1. 先实现固定 validation PDB 的 checkpoint greedy evaluation，并增加 Q-versus-realized
+   return、positive terminal replay ratio 和 priority effective sample size；这是判断其他
+   改动是否有效的前提。
+2. 保持当前 PER+n3+reward scale 不变，只把 epsilon decay 改为 `739,296` 做单变量对照；
+   更理想的是同时测试 actor-specific epsilon。
+3. 开启禁止重复位置，并把 remaining horizon、visited mask 和机械/结构摘要加入状态，修复
+   部分可观测和动作循环问题。
+4. 在确认 terminal predictor 对局部 mutation 确实有分辨率后，再比较 n=6/n=12 或
+   terminal-aware replay。若 predictor 对 strength 几乎不响应，继续调 DDQN 超参数不会解决
+   strength 不增长，应先改善 reward model 或动作/结构更新尺度。
+
+## 2026-08-19：延长 epsilon 衰减实验的结果与停止条件
+
+### 分析对象与单变量对照
+
+本次比较两个 A24、ESM batch 8、F8/G1、prioritized replay、n=3、
+`step_reward_scale=0.025`、`terminal_reward_scale=8.0` 的运行：
+
+```text
+快速衰减对照：
+async_a24_esm8_f8_g1_prioritized_n3_stepx0.025_terminalx8.0_20260814_103321
+epsilon_decay_steps = 50,000
+
+慢速衰减实验：
+async_a24_esm8_f8_g1_prioritized_n3_stepx0.025_terminalx8.0_20260817_142250
+epsilon_decay_steps = 739,296
+```
+
+其余 run configuration 一致，因此这是目前较干净的 epsilon 单变量对照。分析快照中，慢速
+实验约包含 `45.4k episodes / 1.09M transitions / 135.8k optimizer updates`，完成约
+5.9 个 epoch。epsilon 在第 4 epoch 结束时降到 `0.05`，之后已有接近两个 epoch 的低
+epsilon 数据，可初步判断延长探索是否留下后续收益。日志仍在写入，以下数字以本次快照为准。
+
+### 数值稳定性：出现严重暂态价值发散
+
+慢速 epsilon 实验不只是峰值略高，而是在高探索阶段出现了明显的暂态价值发散：
+
+| 指标 | 快速衰减 max（共同 1.09M transitions） | 慢速衰减 max |
+| --- | ---: | ---: |
+| loss | 2.655 | 13,542.899 |
+| mean absolute TD error | 8.675 | 38,947.988 |
+| grad norm | 4.006 | 1,295.766 |
+| mean Q | 16.505 | 75,023.969 |
+| mean target Q | 12.805 | 60,538.406 |
+
+最严重区间是 `100k--250k transitions`，此时慢速实验 mean Q 为 `43,194`、mean TD
+error 为 `18,091`、mean grad norm 为 `432.6`。对应 epsilon 仍约处于 `0.87--0.68`，
+24 个 actor 大部分动作均为随机动作。随着 epsilon 继续降低，指标从峰值恢复；但“恢复”
+不等于已经收敛到上一版本的稳定范围。
+
+在 epsilon 已触底后的共同 `739,296--1,090,000 transitions` 区间：
+
+| 指标 | 快速衰减 mean | 慢速衰减 mean |
+| --- | ---: | ---: |
+| loss | 0.0064 | 0.1348 |
+| mean absolute TD error | 0.3840 | 2.0436 |
+| grad norm | 0.0548 | 9.8064 |
+| mean Q | 0.3522 | 3.9640 |
+| mean target Q | 0.1790 | 2.9324 |
+
+慢速实验在该阶段仍有 `39.6%` 的 update 的 unclipped grad norm 超过阈值 10；快速对照
+为 0。最近 10k updates 中慢速实验已进一步恢复到 `loss=0.081、TD=1.60、grad=6.13、
+Q=3.06`，但仍明显高于快速对照成熟阶段的 `0.004、0.35、0.03、0.22`。因此当前状态
+应描述为“从严重发散中恢复并继续下降”，不能描述为“已经稳定收敛”。
+
+### 为什么慢探索反而放大 Q
+
+epsilon-greedy 的更多随机动作只增加行为数据，不保证 DQN 更稳定或更接近最优策略。当前
+项目同时具备 function approximation、bootstrapping 和 off-policy learning，即经典的
+deadly triad；慢衰减进一步触发了以下正反馈：
+
+1. 每条 transition 只监督一个动作，而每个变长蛋白有 `L*20` 个动作。高 epsilon 产生
+   大量异质、低回报 transition，Q target 的 `max` 仍会选择缺乏真实监督的高估动作。
+2. PER 按绝对 TD error 采样。随机结构中的极端负 reward 或外推 Q 会产生大 TD error，
+   随后被反复采样；`priority_alpha=0.6` 和早期 beta 小于 1 会加强这个反馈。
+3. 24 个 actor 使用同一 epsilon schedule，在前四个 epoch 同时偏向随机探索，没有一组
+   稳定的低 epsilon actor 持续提供较高质量的 exploitation transition。
+4. replay capacity 只有 50,000 transitions，约等于 2,083 个 episode、0.27 epoch。
+   即使探索偶然发现正向轨迹，也可能在一个完整数据集 pass 之前被覆盖；PER 又可能让少量
+   不可约噪声长期占据有效采样质量。
+5. observation 不含 remaining horizon、visited positions 和完整结构历史，同一 ESM2
+   sequence state 对应多个真实 return，进一步增加 bootstrap target 方差。
+
+梯度裁剪和 Huber loss 避免了 NaN/Inf，日志中也没有 FloatingPointError，但它们只能限制
+单次参数更新，不能消除错误 target 和 PER 采样分布导致的价值发散。
+
+### Total/terminal reward 的真实结果
+
+慢速衰减实验按 epoch 聚合如下：
+
+| epoch | mean epsilon | total reward | terminal reward | delta strength z | delta toughness z |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.881 | -0.617 | -0.514 | -0.0059 | -0.1225 |
+| 2 | 0.643 | -0.595 | -0.495 | -0.0069 | -0.1170 |
+| 3 | 0.406 | -0.536 | -0.441 | -0.0061 | -0.1043 |
+| 4 | 0.168 | -0.457 | -0.369 | -0.0054 | -0.0868 |
+| 5 | 0.050 | -0.422 | -0.337 | -0.0053 | -0.0790 |
+| 6（部分） | 0.050 | -0.409 | -0.323 | -0.0054 | -0.0755 |
+
+表面上 total reward 从 `-0.617` 提高到 `-0.409`，但该变化与 epsilon 从 0.88 降到
+0.05 几乎完全重合。训练 episode reward 是当前 epsilon-greedy behavior policy 的表现，
+不是固定 greedy policy 的性能；高随机比例本来就应得到更低训练 reward，所以这条曲线
+不能证明 learner 随训练变好。
+
+进入 `epsilon<=0.051` 后的约 14.7k episodes：
+
+```text
+total reward/order correlation    = 0.0066
+terminal reward/order correlation = 0.0062
+delta strength/order correlation  = -0.0043
+delta toughness/order correlation = 0.0105
+```
+
+均接近 0。相同 PDB 在第 5 到部分第 6 epoch 的配对变化为：
+
+```text
+total reward delta:       +0.0155 +/- 0.0164 (approx. 95% CI)
+terminal reward delta:    +0.0156 +/- 0.0162
+delta strength change:    +0.00006 +/- 0.00156
+delta toughness change:   +0.00383 +/- 0.00330
+```
+
+total、terminal 和 strength 的区间均包含 0，尚无明确改善。toughness 只有边界性的“少
+恶化”信号，仍不是稳定正 improvement。
+
+step shaping 已不再掩盖 terminal：各 epoch 中 total 与 terminal 的相关系数约
+`0.9993--0.9996`，累计 shaping 只有 `-0.085~-0.103`。因此现在 total reward 不增长
+不是 step reward 权重过大，而是 terminal mechanical objective 本身没有被策略有效优化。
+
+strength 尤其停滞：均值一直约为 `-0.005~-0.007`，正向比例约 49%--51%。第 5 epoch
+同时改善 strength 和 toughness 的比例仅 `17.85%`。这表明延长随机探索没有创造可检测的
+strength 学习信号。
+
+### 与快速衰减对照的直接比较
+
+在相同 PDB、相同 epoch 的配对比较中，慢速衰减在前六个 epoch 的 total 和 terminal
+始终更差。第 5 epoch：
+
+```text
+                         快速衰减       慢速衰减       slow-fast
+total reward              -0.379         -0.422         -0.043
+terminal reward           -0.292         -0.337         -0.044
+delta strength z          -0.0040        -0.0053        -0.0012
+delta toughness z         -0.0691        -0.0790        -0.0099
+```
+
+慢速策略在配对 PDB 上取得更高 terminal reward 的比例只有 `47.5%`。到部分第 6 epoch，
+terminal gap 仍约为 `-0.065`。虽然异步训练不是逐 action 的确定性复现，但样本量约 7,700
+且差异持续多个 epoch，当前没有证据支持“把所有 actor 的线性探索延长到四个 epoch 能提高
+力学性能”。
+
+### 当前运行是否还有继续训练的必要
+
+**不建议按当前配置继续完整 64 epoch。** 这次实验已经回答了原假设：统一、长时间的高
+epsilon 没有改善同预算下的 terminal/total reward，反而造成严重暂态 Q 发散，epsilon 触底
+后近两个 epoch 也未出现明确 reward 趋势。继续训练可能让数值进一步恢复，甚至缓慢接近
+快速衰减基线，但这不是该实验原本希望证明的“更充分探索产生更优策略”。
+
+考虑到异步运行不能精确恢复 in-flight tasks/replay，操作上可让当前任务完成第 6 个完整
+epoch并保存整齐 checkpoint，然后停止；也可以直接保留最近 checkpoint。不要仅为观察训练
+reward 曲线继续跑到 64 epoch。后续是否值得从该 checkpoint 开始新实验，应由固定 validation
+PDB 的 `epsilon=0` greedy evaluation 决定：
+
+- 若 epoch 1/4/6 checkpoint 的 paired terminal delta 单调改善且优于快速衰减 checkpoint，
+  才有继续训练的依据；
+- 若 greedy validation 也无改善，则应把该 run 作为负结果结束，转向 reward/state/action
+  设计，而不是继续增加训练时长。
+
+### 当前阶段的主要问题与改进方向
+
+#### P0：先修正评价方式
+
+训练 total reward 混入 epsilon 和不同 actor policy version，不能作为主要模型选择指标。
+下一步应固定 128--256 个 validation PDB，对 untrained、快速衰减 epoch 1/4/6 和慢速衰减
+epoch 1/4/6 checkpoints 做相同 seed、相同 horizon、`epsilon=0` 的 paired evaluation，记录：
+
+```text
+delta_strength_z / delta_toughness_z / delta_terminal
+both-positive fraction / top-k enrichment
+Q(s,a) - realized discounted return
+重复位置与反向突变比例
+```
+
+没有这一评估，继续调 epsilon 只是在改变训练数据收集曲线，无法判断真正的 greedy policy。
+
+#### P1：将“统一慢衰减”改为 actor-specific exploration
+
+异步系统的优势是可以让 actor 承担不同角色，而不是 24 个 actor 同时从 epsilon 1.0 线性
+降到 0.05。下一组实验应始终保留低 epsilon exploitation actors，同时让一部分 actor 使用
+中高 epsilon 收集探索数据。这样 replay 中同时存在策略当前最优附近的数据和新区域数据，
+也避免四个 epoch 几乎完全由随机 behavior 主导。
+
+在没有实现 actor-specific epsilon 前，可先比较 1--2 epoch 的中等 decay（约
+`184,824--369,648 transitions`），而不是继续使用 739,296。探索策略还可由“动作均匀随机”
+改为受约束的 position/substitution exploration，例如禁止重复位置、限制立即反向突变、按
+结构可接受性筛选动作；在 `L*20` 巨大动作空间中，这通常比盲目延长 epsilon 更有效。
+
+#### P2：减弱 PER 对异常 TD 的正反馈
+
+当前 PER 优先大绝对 TD，而不是优先正向 terminal improvement。建议做以下消融，而不是
+一次全部修改：
+
+1. uniform/PER 混合采样，保证基础覆盖；
+2. `priority_alpha` 从 0.6 降至 0.3--0.4，或对 priority 做分位数上限；
+3. 更快将 beta 退火到 1，降低早期采样偏差；
+4. 增大 replay warmup，先建立较完整的数据分布再启动 bootstrap；
+5. 单独记录 positive/negative terminal transition 在 replay、priority top 1% 和 sampled
+   batch 中的比例。
+
+如果高 epsilon 下仍出现 Q 爆炸，再测试 learning rate `1e-4 -> 5e-5`、soft target update
+或 clipped/ensemble Q；这些属于稳定性保护，不应替代 reward 学习信号诊断。
+
+#### P3：增强 terminal credit，而不是继续放大 scale
+
+n=3 对 24-step episode 仍然很短。可以比较 n=6/n=12，或者在 episode 完成后为整条轨迹
+反向计算 Monte Carlo/terminal-aware return，使正向 terminal improvement 直接影响更早动作。
+同时可采用按 reward 符号分层的 terminal replay，保证罕见的正向力学样本不会被大量随机
+失败轨迹和 50k capacity 快速覆盖。
+
+#### P4：补全状态并限制循环动作
+
+当前 `prevent_revisit_positions=false`，观测也不含 visited mask 和 remaining horizon。
+应优先加入：
+
+```text
+remaining_step_fraction
+visited_position_mask
+initial-to-current collision/H-bond/RMSD summary
+initial/current predicted mechanical proxy
+```
+
+并禁止同一位置重复修改或立即 reversal。terminal predictor 基于结构 topology，而 Q state
+主要是序列 ESM2 embedding；不补足结构/history 条件，增加探索只会产生更多相互冲突的
+TD target。
+
+#### P5：确认 reward predictor 对 strength 的局部灵敏度
+
+在继续 RL 前，离线随机抽取蛋白与可接受 mutation，统计随机森林 strength/toughness delta
+的零值率、唯一值数、分位数、单步/多步响应和模型不确定性。如果 strength 对局部 mutation
+几乎不响应，RL 无法从 epsilon、PER 或更多 epoch 中创造缺失的监督信号。日志中还持续出现
+RF 由 scikit-learn 1.6.1 保存、在 1.7.2 加载的版本警告，应先统一版本或重新训练 artifact，
+保证 reward 可复现。
+
+### 最终结论
+
+慢化 epsilon 衰减的实验目标合理，但当前“所有 actor 同步进行四个 epoch 的高随机探索”
+并不适合本项目。它显著加重 off-policy bootstrap 与 PER 的不稳定性，没有在相同数据预算下
+提高 terminal strength/toughness；观察到的训练 total reward 上升主要由 epsilon 自身下降
+造成。当前优先级不再是继续训练或进一步延长探索，而是：
+
+```text
+固定 greedy validation
+-> actor-specific/受约束探索
+-> PER 异常 priority 控制
+-> 更长 terminal credit assignment
+-> Markov state 与循环动作修复
+-> reward predictor 局部灵敏度验证
+```
+
+只有固定验证集证明 checkpoint 的机械属性增量持续改善，才值得重新启动长时完整训练。
+
+## 2026-08-19：固定 greedy validation、PER terminal 诊断与状态补全
+
+### 1. 停止无效的慢 epsilon 衰减实验
+
+通过目标 run directory 的 `train.pid` 在宿主机核对了此前使用
+`--epsilon-decay-steps 739296` 的进程。PID `1678150` 的完整命令行与指定实验一致，随后向其
+进程组 PGID `1678146` 发送 `SIGTERM`。进程在短暂清理后正常退出；再次检查该进程组为空，
+没有残留 PyRosetta actor 或 ESM2 worker，也没有使用 `SIGKILL`。
+
+`train_version_terminal_async.sh` 已删除显式的 `--epsilon-decay-steps 739296`，恢复 CLI 默认值
+`50000` environment transitions。新一轮实验不再把四个 epoch 用于近似随机探索。
+
+### 2. 固定 greedy validation
+
+异步训练此前遇到 `--validate-every > 0` 时只输出“异步模式暂不支持”的 warning。本次增加了
+一个专用 validation actor：
+
+1. 从 validation index 的固定顺序选取前 16 个 PDB；
+2. 启动时对随机初始化策略做一次 baseline validation；
+3. 此后每完成 240 个训练 episode 执行一次；
+4. 每个 PDB 固定使用 `validation_seed + validation_index`，当前 seed 为 `20260819`；
+5. 每轮开始时冻结一份 online Q network 快照，整轮使用 `epsilon=0`；
+6. validation actor 使用独立任务/策略队列，仅共享批量 ESM2 服务；
+7. validation transition 不写入 replay，不推进 environment step，也不改变 epsilon schedule。
+
+每个 PDB 的配对结果写入：
+
+```text
+<run_dir>/logs/validation_episodes.jsonl
+```
+
+聚合结果写入：
+
+```text
+<run_dir>/logs/validation_summary.jsonl
+```
+
+对 `terminal_reward`、`strength_delta_z` 和 `toughness_delta_z` 分别记录：
+
+- mean；
+- median；
+- positive fraction；
+- top 5% mean；
+- top 10% mean；
+- mean 的 bootstrap 95% confidence interval（1000 次重采样）。
+
+这里 top-k 表示该目标增量最高的 k% validation 蛋白的平均增量，不是分类准确率。所有数值同时
+写入 TensorBoard 的 `validation/*` tag，横轴使用冻结策略时的 environment step。固定 greedy
+曲线才是判断策略是否真正改善力学性能的主要依据，训练 actor 的带 epsilon episode reward
+仅作为 behavior-policy 诊断。
+
+### 3. PER positive/negative terminal transition 诊断
+
+ReplayBuffer format 从 v2 升级为 v3，每条 replay row 可额外保存：
+
+```text
+terminal_reward
+terminal_strength_delta
+terminal_toughness_delta
+```
+
+n-step accumulator 会把 episode 末端的三个标签传播到包含该 terminal outcome 的 n-step
+prefix。旧 v1/v2 snapshot 仍可读取，缺失标签以 NaN 表示。
+
+训练按 `--log-every-steps` 周期统计以下三个范围：
+
+```text
+per/replay/*
+per/priority_top_1pct/*
+per/sampled_batch/*
+```
+
+每个范围包含 terminal transition 占全部 transition 的比例，以及 terminal reward、strength、
+toughness 的 positive/negative/zero fraction、样本数和均值。这可以直接判断 PER top 1% 与
+实际 sampled batch 是否持续富集“大 TD error 但 toughness 严重下降”的轨迹。指标被写入
+`optimization.jsonl` 和 TensorBoard 的 `optimization/per/*`。
+
+### 4. 避免动作循环并补全 observation
+
+启动脚本已同时打开：
+
+```bash
+--prevent-revisit-positions
+--include-visited-mask-in-observation
+```
+
+action mask 会硬屏蔽本 episode 已修改的位置；环境还会在每个残基的 1280 维 ESM2 embedding
+后追加一个 visited 标量通道，因此 Q head 输入为 `(L, 1281)`。初始值均为 0，某位置接受突变
+后对应值变为 1。DDQNAgent、QNetwork、CPU actor policy、variable-length replay collation 和
+checkpoint shape 检查均已适配该额外通道。
+
+该实现解决了此前“约束存在于 action mask，但 Q observation 看不到 episode 历史”的部分
+可观测问题。旧 `(L, 1280)` 模型仍受支持；新 `(L, 1281)` 运行不能直接恢复旧 checkpoint，
+应启动新实验。
+
+### 5. Replay capacity
+
+脚本将 replay capacity 从 50,000 调整为 200,000，可覆盖约一个训练 epoch 的 transition。
+当前 replay 保存 current/next ESM2 embedding，因此 200k 的 RAM 上限约为 50k 配置的四倍。
+脚本继续使用 `--replay-checkpoint-every 0 --no-save-final-replay`，避免生成超大 replay 文件；
+正式运行时仍需监控主机内存，若发生内存压力，应优先实现 embedding 去重/压缩，而不是静默
+降低实际 capacity。
+
+### 6. 启动参数与查看方式
+
+```bash
+bash train_version_terminal_async.sh
+tensorboard --logdir <run_dir>/tensorboard
+```
+
+当前关键参数为：F8/G1、24 个 training actors、1 个 validation actor、PER、n-step=3、
+step reward scale=0.025、terminal reward scale=8、replay capacity=200k、默认 50k epsilon
+衰减、每 240 episodes 在 16 个固定 PDB 上做 greedy validation。
+
+### 7. 测试结果
+
+执行了脚本语法检查、Python 编译检查和完整测试套件：
+
+```text
+bash -n train_version_terminal_async.sh
+python -m pytest -q
+137 passed, 2 skipped in 10.19s
+```
+
+新增测试覆盖 visited observation 更新、1281 维 per-residue agent 前向、terminal metadata 的
+n-step 传播、replay/top-1%/sampled-batch 三类 PER 统计、固定验证 bootstrap/top-k 汇总以及
+validation TensorBoard 写入。两个 skipped 测试为原项目中依赖可选外部运行条件的测试，不是
+本次修改失败。
+
+## 2026-08-20：孤儿 worker 清理与 learner 生命周期保护
+
+### 1. 宿主机孤儿进程清理
+
+在宿主机进程命名空间中，以用户、`PPID`、`PGID` 和完整命令行联合核验，发现以下 5 个已经
+失去 learner 的异步训练进程组：
+
+```text
+14691
+719784
+847883
+872961
+3071407
+```
+
+组内进程全部属于 `jianquanzhao`，`PPID=1`，命令均为 mprl-vgpt 环境中的
+`multiprocessing.spawn` 或 `multiprocessing.resource_tracker`。对应的进程组 leader/learner
+均已不存在，因此它们不是仍在运行的有效训练任务。5 个进程组合计占用超过 100 GiB RSS，
+也是新任务发生主机内存压力的重要背景因素。
+
+向 5 个进程组发送 `SIGTERM` 后，所有进程均在等待窗口内正常退出，不需要 `SIGKILL`。随后
+再次扫描宿主机，未发现属于该用户且符合上述命令特征的 `PPID=1` 孤儿 worker。
+
+### 2. Worker 父进程存活监控
+
+此前 actor 和 ESM2 worker 只检查共享 `stop_event`。learner 正常进入 `finally` 时会设置该
+事件；但 learner 被 OOM killer、管理员或外部程序直接 `SIGKILL` 后，没有存活进程负责设置
+事件，worker 就会继续阻塞在任务、推理和结果队列上。
+
+`model/asynchronous_module/runtime.py` 新增 `WorkerParentGuard`：
+
+1. learner 在创建 worker 时将自己的 PID 显式传入；
+2. worker 启动时验证实际 `PPID` 与 learner PID 一致；
+3. Linux 下通过 `prctl(PR_SET_PDEATHSIG, SIGTERM)` 注册 parent-death signal；
+4. 注册后再次检查 `PPID`，关闭“检查完成但 signal 尚未注册”这一竞态窗口；
+5. ESM2 队列轮询、动态 batching、推理边界及 actor 任务轮询、环境 step 边界均执行 PPID
+   检查，作为非 Linux 平台的回退机制，也提供明确的生命周期约束；
+6. 父进程消失属于预期的异常关闭路径，worker 直接退出，不再尝试向已经无人消费的 fatal
+   queue 写入消息。
+
+该保护覆盖 training actor、固定 greedy validation actor 和全部 ESM2 inference worker。
+正常训练结束仍沿用原来的 `stop_event -> sentinel -> join -> terminate` 清理流程。
+
+### 3. Learner 退出码记录
+
+新增可执行脚本：
+
+```text
+scripts/supervise_training.sh
+```
+
+`train_version_terminal_async.sh` 现在由低内存 supervisor 启动并等待 learner。运行目录新增：
+
+```text
+supervisor.pid
+train.pid
+learner_started_at
+learner_finished_at
+learner_exit_code
+learner_exit_reason
+```
+
+`train.pid` 仍保存真实 learner PID，因此原有停止和检查方式保持兼容；`supervisor.pid` 单独记录
+监督进程。正常结束会得到 `learner_exit_code=0`、`learner_exit_reason=completed`；如果 learner
+被 `SIGKILL`，典型记录为 `137` 和 `signal:KILL`。supervisor 收到 `TERM/INT/HUP` 时会先把
+信号转发给 learner，再等待并记录最终状态。
+
+### 4. 验证结果
+
+完成以下验证：
+
+```text
+bash -n train_version_terminal_async.sh scripts/supervise_training.sh
+python -m py_compile asynchronous_training.py model/asynchronous_module/runtime.py
+python -m pytest -q --disable-warnings
+139 passed, 2 skipped in 8.69s
+```
+
+额外进行了两个生命周期集成测试：
+
+1. supervisor 管理的短任务正常退出，记录 `0/completed`；
+2. 对受 supervisor 管理的 learner 发送 `SIGKILL`，记录 `137/signal:KILL`；
+3. 对已注册 parent-death signal 的测试 worker 杀死其父进程，worker 在 2 秒检查窗口内自动
+   消失，没有形成 `PPID=1` 孤儿。
+
+这次修改解决的是 learner 异常死亡后的可观测性与 worker 泄漏。它不会消除 learner 本身的
+OOM 风险；当前 200k replay capacity 对 per-residue current/next ESM2 embedding 仍然非常
+激进，后续仍应通过降低 capacity 或压缩、去重 replay state 控制峰值内存。
+
+## 2026-09-10：正向终端样本保留与分层优先经验回放
+
+### 1. 修改依据
+
+截至上一轮长期训练快照，训练行为策略的 reward 已由较差状态明显“少负化”，但固定 greedy
+validation 仍未稳定转正。Replay 诊断显示：终端 transition 约占全部 replay 的 12.5%，其中
+正 terminal reward 约占 43.5%，所以真正的正向终端 transition 只占全部 replay 的约：
+
+```text
+12.5% * 43.5% = 5.4%
+```
+
+而 priority top 1% 中虽然终端 transition 占约 79%，正 terminal reward 只占约 11.5%。
+这说明纯 absolute TD-error PER 主要优先学习“大幅失败”，有利于减少严重 toughness 下降，
+但不会主动保证正向力学改善轨迹进入 batch。为此，本次没有取消 PER，而是在其上加入正向
+终端样本的存储保留和分层采样。
+
+### 2. 正向样本定义
+
+正向 transition 定义为：
+
+```text
+is_positive = isfinite(terminal_reward)
+              and terminal_reward > positive_reward_threshold
+```
+
+默认阈值为0。普通 transition 即使局部 step shaping 为正，只要没有携带 episode terminal
+outcome，也不会进入正向层。当前使用 n-step=3，因此一个正向 episode 的 terminal outcome
+会传播到最后3个 n-step prefix；这些 transition 均属于正向层。这一口径直接对应最终力学
+代理改善，不会把局部碰撞或氢键 shaping 误当成终端成功。
+
+### 3. 正向样本保留
+
+`ReplayBuffer` 新增：
+
+```text
+positive_replay_reserve_fraction
+positive_reward_threshold
+positive_count
+positive_fraction
+```
+
+buffer 未满时仍按原顺序写入，不人为丢弃数据。buffer 满载且已积累足够正样本后，负样本写入
+会优先覆盖非正向 slot，避免正向样本比例跌破 reserve；正样本不足 reserve 时，新增正样本也
+优先覆盖非正向 slot。该策略不复制 state/next_state，因此不会因正向保留再次放大 ESM2
+embedding 的内存分配。
+
+启动脚本默认：
+
+```text
+positive_replay_reserve_fraction = 0.10
+positive_reward_threshold = 0.0
+```
+
+相对上一轮约5.4%的自然正向 transition 比例，10%的保留下限约提高至1.8倍。该下限只有在
+数据流中实际发现足够正向 transition 后才能达到；它不能凭空制造正样本。
+
+### 4. 正向分层 PER
+
+采样时把 replay 划分为 positive 和 remaining 两个互斥层。batch 首先按
+`positive_sample_fraction` 分配最低正向配额，然后在每层内部继续使用原 Ape-X 风格的
+absolute TD-error priority：
+
+```text
+P(i | stratum) proportional to (abs(TD error_i) + epsilon)^alpha
+```
+
+importance weight 校正每层内部的 PER 偏置，但不会消除人为设定的层间正向配额。这样即使
+beta 退火到1，正向 transition 仍保持目标 batch 占比，而不是被完整校正回约5.4%的原始
+replay 分布。若某一阶段尚无正向样本，采样自动回退到原 uniform/PER；若正样本数量不足且
+采用无放回采样，则只使用实际可用数量并由另一层补足 batch。
+
+启动脚本默认：
+
+```text
+positive_sample_fraction = 0.25
+```
+
+batch size=128 时至少抽取32条正向 transition。相对上一轮自然期望约7条，单批正向曝光率
+约提高4.6倍。其余96条仍覆盖零/负 terminal transition 和普通中间 transition，因此保留了
+失败规避与 Bellman 状态覆盖。
+
+### 5. 参数和启动方式
+
+新增 CLI：
+
+```text
+--positive-sample-fraction
+--positive-replay-reserve-fraction
+--positive-reward-threshold
+```
+
+三个 CLI 参数默认分别为 `0/0/0`，因此普通 `training.py` 保持向后兼容。异步启动脚本
+`train_version_terminal_async.sh` 显式采用 `0.25/0.10/0.0`，并支持环境变量覆盖：
+
+```bash
+MPRL_POSITIVE_SAMPLE_FRACTION=0.25 \
+MPRL_POSITIVE_REPLAY_RESERVE_FRACTION=0.10 \
+MPRL_POSITIVE_REWARD_THRESHOLD=0.0 \
+bash train_version_terminal_async.sh
+```
+
+建议至少做以下三个同 environment-step、同 seed 对照：
+
+```text
+A: sample=0.00, reserve=0.00  原始 TD-PER 基线
+B: sample=0.25, reserve=0.00  只检验正向采样效率
+C: sample=0.25, reserve=0.10  检验采样与长期保留的组合效果
+```
+
+不要直接从旧 replay snapshot 续训后声称完成严格对照；新的分层语义应从新 replay 开始。
+可以使用相同初始 agent checkpoint，但三组实验必须使用相同 checkpoint 和数据顺序。
+
+### 6. 日志与判断标准
+
+`terminal_outcome_diagnostics()` 新增：
+
+```text
+positive_terminal_count
+positive_terminal_fraction
+positive_reward_threshold
+```
+
+这些字段会进入 `optimization.jsonl` 和 TensorBoard：
+
+```text
+optimization/per/replay/positive_terminal_fraction
+optimization/per/priority_top_1pct/positive_terminal_fraction
+optimization/per/sampled_batch/positive_terminal_fraction
+```
+
+首先检查 replay 是否逐渐达到10%、sampled batch 是否稳定达到25%；随后以固定 greedy
+validation 的 terminal reward mean/median、positive fraction、strength/toughness delta 和
+bootstrap CI 为效果标准。若采样占比达到目标而固定验证仍不改善，主要瓶颈更可能是正向动作
+可达性、状态表征或 reward predictor 灵敏度，而不是正向样本曝光不足。
+
+### 7. 修改文件
+
+```text
+model/replay_buffer_module/replay_buffer.py
+model/replay_buffer_module/README_REPLAY_BUFFER.md
+training.py
+asynchronous_training.py
+train_version_terminal_async.sh
+tests/test_replay_buffer.py
+tests/test_training_multi_gpu.py
+```
+
+Replay snapshot format 从v3升级到v4，保存正向采样、reserve和阈值配置；v1-v3仍可按原配置
+加载。新增测试覆盖正向 batch 配额、无正样本回退、满载后的 reserve、诊断字段及 snapshot
+恢复。
+
+### 8. 测试结果
+
+```text
+Python compile: passed
+bash syntax: passed
+git diff --check: passed
+targeted replay/agent/training: 81 passed, 2 skipped
+full repository: 152 passed, 2 skipped in 20.18s
+```
+
+额外比例 smoke test 使用容量100、自然正样本率5%的流，连续写入500条 transition：
+
+```text
+replay_size=100
+positive_count=10
+positive_fraction=0.10
+sampled_batch_size=128
+sampled_positive_count=32
+sampled_positive_fraction=0.25
+```
+
+结果符合配置。该改造解决的是正向样本保留和曝光不足，不代表模型必然得到正 reward；是否
+有效仍由固定 greedy validation 的跨 checkpoint 趋势和多 seed 对照决定。
+
+## 2026-09-14：基于下置信界和 episode 去重的正样本采样
+
+### 1. 修改动机与上一版失效原因
+
+上一版把 `terminal_reward > 0` 的每条 n-step transition 都视为独立正样本。这个口径有两个
+明显风险：
+
+1. 很小的正值可能只来自 PyRosetta repack/relax 波动或 predictor 误差，并不代表可重复的
+   力学改善。
+2. `n_step=3` 会把同一个 episode 的 terminal outcome 传播到最后3条 replay row。同一条
+   成功轨迹因此可以在一个 batch 中占据多个正样本位置，表面上提高了正样本比例，却没有
+   增加独立成功事件的信息量。
+
+本次将正样本判据改为：
+
+```text
+positive_episode = isfinite(terminal_reward_lcb)
+                   and terminal_reward_lcb > positive_reward_lower_bound
+```
+
+比较使用严格大于。`positive_reward_lower_bound` 默认是0，可作为最小改善/噪声边界调高。
+如果环境提供了由重复松弛计算的 `terminal_reward_lcb`，ReplayBuffer 直接使用它；如果没有，
+则回退到 point terminal reward。这个回退保证当前训练可运行，但不等价于已经估计了统计
+置信区间。要获得真正的 LCB，仍需按后文方案重复 repack/relax 后计算。
+
+### 2. Episode 级去重实现
+
+每条 actor transition 现在携带全局 `episode_id`。n-step accumulator 会把 terminal reward、
+terminal reward LCB、strength/toughness delta 和 episode ID 一起传播到 terminal-bearing
+prefix。
+
+正向分层采样时先按 episode ID 分组，每个正向 episode 只保留一条候选 replay row：
+
+```text
+representative(e) = argmax priority_i, i belongs to positive episode e
+```
+
+随后在 episode representatives 中继续执行原有的 TD-error PER。这使高 TD-error 的成功经验
+仍被优先学习，同时保证一次 batch 的正向配额不会被同一 episode 的3条 n-step row 重复
+占据。旧 replay checkpoint 没有 episode ID，因此按未知 ID 载入并维持旧行为，不伪造
+episode 边界。
+
+当 unique positive episode 不足目标配额时，只抽取实际可用数量，由 remaining stratum 补齐；
+当无放回 batch 在极端情况下连“唯一正 episode + remaining rows”都不足时，才回退到
+transition 级采样以保证 learner 不因无法构造 batch 而停止。
+
+### 3. 参数与兼容性
+
+训练 CLI：
+
+```text
+--positive-sample-fraction       默认 0.25
+--positive-reward-lower-bound    默认 0.0
+--positive-replay-reserve-fraction
+```
+
+`--positive-reward-threshold` 作为旧名称仍然可用，并映射到同一个参数。异步启动脚本提供：
+
+```text
+MPRL_POSITIVE_SAMPLE_FRACTION
+MPRL_POSITIVE_REWARD_LOWER_BOUND
+MPRL_POSITIVE_REPLAY_RESERVE_FRACTION
+```
+
+旧环境变量 `MPRL_POSITIVE_REWARD_THRESHOLD` 也保留为 lower-bound 的回退值。Replay snapshot
+格式升级到 v5，新增 `terminal_reward_lcbs` 和 `episode_ids`；v1-v4 仍可读取，旧版本 LCB
+回退为 point terminal reward、episode ID 记为未知。
+
+建议顺序运行三组同 seed、同初始 agent、同数据顺序、同 environment-step 的对照，不要让三组
+同时竞争 PyRosetta CPU 和 ESM GPU：
+
+```bash
+MPRL_POSITIVE_SAMPLE_FRACTION=0.10 \
+MPRL_POSITIVE_REWARD_LOWER_BOUND=0.0 \
+MPRL_RUN_LABEL=positive_episode_10pct \
+bash train_version_terminal_async.sh
+
+MPRL_POSITIVE_SAMPLE_FRACTION=0.15 \
+MPRL_POSITIVE_REWARD_LOWER_BOUND=0.0 \
+MPRL_RUN_LABEL=positive_episode_15pct \
+bash train_version_terminal_async.sh
+
+MPRL_POSITIVE_SAMPLE_FRACTION=0.25 \
+MPRL_POSITIVE_REWARD_LOWER_BOUND=0.0 \
+MPRL_RUN_LABEL=positive_episode_25pct \
+bash train_version_terminal_async.sh
+```
+
+第一轮先固定 lower bound 为0，只比较采样比例。第二轮应使用 predictor 重复性实验得到的噪声
+阈值或经验 LCB，避免同时改变两个变量。
+
+### 4. 新增诊断与判断标准
+
+`terminal_outcome_diagnostics()` 的正样本统计改为基于 LCB，并新增：
+
+```text
+terminal_reward_lcb_*
+known_episode_transition_count
+unique_episode_count
+episode_duplicate_fraction
+positive_known_episode_transition_count
+positive_unique_episode_count
+positive_episode_duplicate_fraction
+positive_reward_lower_bound
+```
+
+这些字段会沿用现有记录链进入 `optimization.jsonl` 和 TensorBoard 的以下命名空间：
+
+```text
+optimization/per/replay/*
+optimization/per/priority_top_1pct/*
+optimization/per/sampled_batch/*
+```
+
+正常情况下，`sampled_batch/positive_terminal_fraction` 应接近设置的10%、15%或25%，且
+`sampled_batch/positive_episode_duplicate_fraction` 应为0。最终效果仍以固定 greedy
+validation 的 terminal reward、strength/toughness delta、positive fraction 和 bootstrap CI
+为准，不能以 sampled batch 的正样本占比作为模型改善证据。
+
+### 5. 力学 predictor 可执行分析方案
+
+#### 5.1 要检验的假设
+
+```text
+H1 稀疏性：在一个给定结构上，真正改善力学性能的单点突变占比极低。
+H2 不可重复性：突变效应小于 repack/relax 和 predictor 的波动，reward 符号不稳定。
+H3 不可识别性：改善动作客观存在，但当前 ESM2 sequence state 无法预测其方向。
+H4 OOD/代理失真：突变结构离 predictor 训练分布过远，RF 外推结果不能作为可靠排序。
+```
+
+#### 5.2 固定扫描面板
+
+从固定 validation split 中选择24个蛋白，按 sequence length、初始 strength、初始 toughness
+分层抽样，并固定 PDB 列表和随机种子。该面板不能参与 predictor 或辅助 probe 的训练。
+每个蛋白最多均匀抽64个可变位置，短蛋白使用全部位置；每个位置扫描除 wild type 外的19种
+氨基酸。pilot 上限约为：
+
+```text
+24 proteins * 64 positions * 19 substitutions = 29,184 actions
+```
+
+第一阶段每个 action 只执行一次与 RL 完全一致的 local repack/relax 和七特征 RF 推理，记录：
+
+```text
+protein_id, position, wt_aa, mutant_aa, seed
+strength_initial, strength_final, delta_z_strength
+toughness_initial, toughness_final, delta_z_toughness
+terminal_reward_point
+7 initial features, 7 final features, feature deltas
+Rosetta energy, accepted/rejected, failure reason
+```
+
+#### 5.3 重复性与 LCB
+
+每个蛋白从初筛结果选择 top 20、接近0的20个和 bottom 20个 action，分别用5个固定但不同的
+PyRosetta seeds 从同一个初始结构重新执行 repack/relax。每个 action 计算 reward mean、SD、
+符号一致率，以及单侧95% bootstrap LCB：
+
+```text
+LCB_95(action) = percentile_5%(bootstrap means)
+```
+
+同时估计 action 间方差与同一 action 重复方差，并计算：
+
+```text
+ICC = variance_between_actions
+      / (variance_between_actions + variance_within_action)
+```
+
+这一步给出可用于训练的实际 `terminal_reward_lcb`，也给出合理的
+`--positive-reward-lower-bound`。RF 各树的标准差可以作为 OOD 辅助指标，但不能替代重复
+结构松弛的经验置信区间。
+
+#### 5.4 稀疏性和可达上界
+
+分别以 point reward 和 `LCB_95 > lower_bound` 统计：
+
+```text
+positive action density per protein
+至少存在1/5/10个正向 action 的蛋白比例
+top-1、top-5、top-10 attainable terminal reward
+strength/toughness 同时改善的 Pareto-positive 比例
+按位置、二级结构、氢键网络区域和氨基酸替换类型分层的正动作密度
+```
+
+除总体均值外必须报告 protein-level median 和 bootstrap CI，防止少数长蛋白凭借更多 action
+主导统计结果。
+
+#### 5.5 当前 observation 的动作可识别性
+
+在 protein-grouped cross-validation 下训练两个只用于诊断的轻量 probe：
+
+1. `ESM2 per-residue embedding + position + mutant-AA one-hot -> action reward/positive LCB`；
+2. `初始结构七特征 + candidate feature delta -> action reward/positive LCB`，作为结构信息上界。
+
+比较 held-out protein 上的 Spearman、top-5%/top-10% hit rate、enrichment factor、PR-AUC 和
+校准曲线。若结构 probe 明显有效而 ESM2 probe 无效，说明当前 RL state 存在部分可观测性，
+应把氢键/拓扑/局部几何特征加入 observation，或在 action 选择时加入廉价结构 look-ahead；
+此时继续提高 replay 正样本比例不会解决根因。
+
+#### 5.6 OOD 检查与决策门槛
+
+把 candidate 的七维特征与 RF 训练特征分布比较，记录 robust z-score、最近邻距离和 RF tree
+dispersion。建议用以下门槛作为下一步工程决策，而不是当作生物学定律：
+
+```text
+稀疏：median positive-LCB action density < 1%，或 >50% 蛋白没有正向 action
+噪声主导：median sign agreement < 0.8，或 ICC < 0.5
+状态不可识别：ESM2 probe Spearman < 0.2 且 top-10% EF < 1.5，结构 probe 明显更高
+明显 OOD：正向候选主要集中在训练特征范围之外，且 tree dispersion 同时升高
+```
+
+对应策略：可靠但稀疏时改进 actor proposal/curriculum；噪声主导时使用重复松弛、ensemble 和
+LCB reward；状态不可识别时补充结构 observation；OOD 或代理平坦时先重训/校准 mechanical
+predictor，再继续 RL。
+
+#### 5.7 推荐实现与产物
+
+后续实现建议采用 CPU PyRosetta worker 并行、主进程集中写表，避免每个 worker 同时写 CSV：
+
+```text
+code:
+model/reward_module/mechanical-properties-predictor/analyze_reward_landscape.py
+
+outputs:
+outputs/mechanical_property_predictor/reward_landscape/
+  panel.csv
+  single_mutation_screen.parquet
+  repeated_relax.parquet
+  protein_summary.csv
+  probe_metrics.json
+  figures/
+```
+
+建议 CLI 形态：
+
+```bash
+python model/reward_module/mechanical-properties-predictor/analyze_reward_landscape.py \
+  --pdb-index <fixed_validation_index> \
+  --model-artifact params/hbond_random_forest.joblib \
+  --num-proteins 24 --max-positions 64 \
+  --screen-repeats 1 --confirm-repeats 5 \
+  --bootstrap-samples 2000 --lcb-alpha 0.05 \
+  --workers 24 --seed 20260914 \
+  --output-dir outputs/mechanical_property_predictor/reward_landscape
+```
+
+先完成约29k action 的 pilot 和约7.2k次确认重复，再依据结果决定是否扩展到全部位置或更多
+蛋白；直接对约7k个蛋白做 `L*19*5` 全扫描成本过高，且在判断 H1-H4 前没有必要。
+
+### 6. 修改文件与验证
+
+```text
+model/replay_buffer_module/replay_buffer.py
+model/replay_buffer_module/n_step.py
+model/replay_buffer_module/__init__.py
+model/replay_buffer_module/README_REPLAY_BUFFER.md
+model/asynchronous_module/runtime.py
+training.py
+asynchronous_training.py
+train_version_terminal_async.sh
+tests/test_replay_buffer.py
+tests/test_n_step.py
+tests/test_training_multi_gpu.py
+```
+
+测试结果：
+
+```text
+Python compile: passed
+bash syntax: passed
+git diff --check: passed
+targeted replay/n-step/training/asynchronous: 62 passed, 2 skipped
+full repository: 156 passed, 2 skipped in 12.02s
+
+batch-size 128 ratio smoke test:
+10% -> 13 positive rows from 13 unique positive episodes
+15% -> 20 positive rows from 20 unique positive episodes
+25% -> 32 positive rows from 32 unique positive episodes
+```
+
+本轮没有启动长期 RL，也没有凭 RF tree dispersion 伪造 LCB。代码已经具备接收真实
+`terminal_reward_lcb` 的接口；应先通过上述固定面板测出 reward landscape 和重复松弛噪声，
+再决定 lower bound 与10%/15%/25%中哪一个采样比例值得进入长期训练。
+
+## 2026-09-15：ESM2 + PyRosetta 正向动作监督预训练方案评估
+
+### 1. 总体结论
+
+该方案合理，且比继续单独调整 PER 正样本比例更接近当前问题的核心：PER 只能增加已经发现的
+成功经验的学习次数，不能提高 actor 在巨大动作空间中首次发现成功动作的概率；监督预训练可以
+直接给 Q head 一个“哪些突变更可能改善力学性能”的初始排序。
+
+但是不建议把方案实现为“只收集正样本，然后把正样本 action 做普通分类 SFT”。只有正样本
+没有同一状态下的负样本和近零样本，模型无法学习动作之间的相对优劣，也容易把所有动作分数
+同时抬高。更合适的定义是：
+
+```text
+基于结构扫描结果的 supervised action-value / action-ranking pretraining
+```
+
+它可以视为面向 DDQN 的 SFT，也与 demonstration pretraining 的思想一致。监督阶段学习动作
+排序和保守的一步改善值，随后再由 DDQN 学习多步 long-horizon return。
+
+建议采用以下完整路线：
+
+```text
+固定训练蛋白和结构状态
+    -> ESM2 编码当前序列
+    -> 枚举/提议候选突变
+    -> 从同一个 current pose 独立执行 PyRosetta local repack/relax
+    -> mechanical predictor 计算 paired reward mean 和 LCB
+    -> 构造 positive + hard-negative + neutral 的状态级排序数据
+    -> 监督预训练当前 per-residue Q head
+    -> 从中间多突变状态继续扫描并聚合数据
+    -> online/target network 同步加载 SFT checkpoint
+    -> DDQN 在线微调
+```
+
+### 2. ESM2 在方案中的准确职责
+
+“使用 ESM2 单独探索正样本”需要稍作修正。ESM2 给出的是序列表征和进化/语言模型意义上的
+氨基酸合理性，并不直接知道氢键拓扑或力学性能，因此不能单独判断 mechanical-positive
+action。推荐分工如下：
+
+1. ESM2 per-residue embedding 是 SFT/DDQN 的状态输入；
+2. ESM2 masked-token probability 可以作为候选突变 proposal 或结构合理性过滤条件；
+3. PyRosetta 负责构造突变后的局部结构；
+4. 当前七特征 random forest predictor 负责产生 strength/toughness 和 scalar reward 标签；
+5. 重复 repack/relax 的 paired bootstrap LCB 负责判断该正向标签是否超过噪声。
+
+如果对每个位置的19种替换全部计算 reward，候选生成并不需要 ESM2；这时 ESM2 只需对每个
+唯一 state 编码一次。若后续为了节省计算只保留 ESM2 top-k substitution，必须先在全扫描
+pilot 上检查它对 positive-LCB action 的 recall，避免进化合理性过滤掉罕见但有效的力学突变。
+
+### 3. 该方案能解决和不能解决的问题
+
+能够缓解：
+
+```text
+冷启动：随机 Q head 在 L*19 级动作空间中没有有效排序。
+奖励稀疏：模型在 RL 前已经接触可靠的正向和负向动作对比。
+正样本曝光不足：一个可靠正向 action 可直接监督，而不必等待在线 actor 偶然访问。
+训练初期 Q 排序混乱：SFT 可提高 greedy/top-k proposal 的正动作密度。
+```
+
+不能自动解决：
+
+```text
+reward predictor 本身不准确或被优化利用；
+PyRosetta 重复松弛噪声大于突变效应；
+ESM2 sequence observation 无法识别依赖当前三维构象的动作；
+单点改善不具有可加性，多个突变存在显著 epistasis；
+只扫描初始 WT，而 RL 在第2至24步访问的是完全不同的多突变状态。
+```
+
+因此 SFT 是否值得扩展，必须由正在进行的 LCB/action-landscape 实验先证明“可靠正动作确实
+存在”，再由 held-out protein 的监督排序结果证明“当前 observation 能识别这些动作”。
+
+### 4. 数据生成方案
+
+#### 4.1 数据边界和拆分
+
+只对 RL training split 生成 SFT 数据。固定 greedy validation PDB 以及与其高度相似的序列
+cluster 必须完全排除，防止 SFT 预先看过验证动作。
+
+当前索引约有7700个 training PDB 和855个 validation PDB；力学标签 CSV 中可解析到7041条
+序列，平均长度105.39 aa。按 CSV 粗略计算，完整单点全扫描规模为：
+
+```text
+sum(sequence_length * 19) = 14,099,102 candidate actions
+```
+
+训练索引与 CSV 数量并不完全一致，因此正式扫描前需要生成一个 manifest，只保留 PDB、序列、
+predictor 标签和 split 能唯一匹配的 entry，并记录所有被排除原因。
+
+直接对全部数据执行约1410万次 PyRosetta 更新并不适合作为第一步。按此前异步训练约10个
+environment step/s 的量级粗估，一次扫描就需要约16天，重复5次则不可接受。建议分三级执行：
+
+```text
+Pilot：24个分层蛋白，最多64个位置，每个位置19个替换，约29,184 actions。
+Scale-1：512至1000个 sequence-cluster 分层蛋白，先单次扫描，再确认候选。
+Scale-2：只有 Pilot/Scale-1 证明有效后，才扩展蛋白数量或位置覆盖。
+```
+
+#### 4.2 每个 state 的扫描规则
+
+对一个给定 current state：
+
+1. 缓存一次 ESM2 embedding 和 action mask；
+2. 对每个允许位置生成19个非 no-op substitutions；
+3. 每个候选都从完全相同的 current pose clone 开始，禁止前一个候选影响后一个候选；
+4. 使用与 RL 相同的 local repack/relax、radius、score function 和 predictor artifact；
+5. 保存失败、拒绝和结构质量异常的候选，不能只保存成功结果；
+6. 对初筛 top、near-zero、bottom 以及随机候选执行多个固定 seed 的重复松弛；
+7. 使用配对差值减少初始构象噪声。
+
+一个中间状态 `s` 上 action `a` 的监督标签应同时保留：
+
+```text
+R_absolute(s+a) = terminal score of candidate relative to episode initial structure
+R_marginal(s,a) = terminal score(s+a) - terminal score(s)
+```
+
+动作排序主要使用 `R_marginal`，因为它回答“在当前状态继续执行该突变是否改善”；
+`R_absolute` 用于检查整个 episode 是否已经达到正 terminal reward。重复松弛时对每个 seed
+先计算 paired marginal difference，再对 paired means bootstrap，得到：
+
+```text
+LCB_95(s,a) = percentile_5%(bootstrap paired mean reward)
+positive(s,a) = LCB_95(s,a) > configured_noise_boundary
+```
+
+#### 4.3 必须包含的样本类型
+
+不能只保存 positive action。每个 state 至少包含：
+
+```text
+confirmed positive：LCB 超过边界；
+hard negative：point reward 看起来为正，但 LCB 不大于边界；
+near-zero：处于 predictor/repack 噪声带内；
+clear negative：稳定降低 terminal reward；
+structural failure：碰撞、缺失原子、repack/relax 失败或明显 OOD。
+```
+
+hard negative 尤其重要，它直接教模型不要把偶然的 point-positive 当作机械改善。batch 应按
+state/protein 平衡，而不是让长蛋白或正样本多的蛋白贡献更多权重。
+
+推荐数据字段：
+
+```text
+protein_id, sequence_cluster, state_id, parent_state_id, mutation_depth
+sequence, visited_mask, current_pdb, state_hash
+position, wildtype_aa, mutant_aa, action_index, valid_action
+reward_point, reward_mean, reward_sd, reward_lcb, reward_sign_agreement
+delta_strength_mean/lcb, delta_toughness_mean/lcb
+initial/final 7 structural features and feature deltas
+Rosetta energy delta, predictor OOD diagnostics, seed, failure reason
+```
+
+ESM2 embedding 应按 `state_hash + model_version` 缓存为 float16/memmap，数据表只保存 cache key，
+不要为每个 action 重复存储同一份 `(L,1280)` embedding。
+
+### 5. 从单点 WT 扩展到多步状态
+
+只在 WT 上扫描会造成明显 covariate shift：SFT 学到第一步后，RL 的后续23步仍处于未见状态。
+不建议穷举多步组合，而采用迭代式数据聚合：
+
+```text
+Round 0：扫描 WT states，训练 SFT-v0。
+Round 1：用 SFT-v0 在 training proteins 上走到 depth 1/2/4，保存访问状态并扫描候选。
+Round 2：训练 SFT-v1，再收集 depth 4/8/16 状态。
+Round 3：检查 depth 24 的固定 greedy rollout，不再默认扩大数据。
+```
+
+中间状态不需要扫描全部动作。可组合以下候选：
+
+```text
+当前 SFT top-32 actions
+ESM2 plausibility top-16 actions
+uniform/chemically-diverse random 16 actions
+```
+
+这样既覆盖模型认为好的动作，也保留发现模型盲区的机会。每轮必须按 `state_hash` 去重，并保留
+visited mask；相同序列但已访问位置不同是不同的 RL state。
+
+### 6. 监督目标：排序优先，不直接拟合长程 Q
+
+当前网络接收 contextual ESM2 per-residue embedding 加 visited flag，并对每个 residue 输出20个
+Q values。其结构可以直接用于监督预训练，无需先更换网络。
+
+推荐每个 state 构造一个保守目标分布：
+
+```text
+y(s,a) = clipped reward_lcb(s,a)
+p*(a|s) = softmax(y(s,a) / temperature), valid actions only
+```
+
+第一版损失建议由三部分组成：
+
+```text
+L_listwise = KL[p*(a|s) || softmax(Q(s,a)/temperature_q)]
+L_rank     = max(0, margin - Q(s,positive) + Q(s,hard_negative))
+L_reg      = Huber(Q(s,a), clipped reward_lcb(s,a))
+
+L_SFT = L_listwise + lambda_rank * L_rank + lambda_reg * L_reg
+```
+
+`L_listwise` 学习整个 action surface 的相对排序；`L_rank` 强化正样本与难负样本的间隔；
+`L_reg` 约束输出尺度，避免所有 Q values 同时增大。lambda、temperature 和 margin 应由 SFT
+validation 调节，而不应先固定成未经验证的常数。
+
+保留 strength 和 toughness 的独立标签用于分析和可选 auxiliary loss，但基本版仍使用与 RL
+一致的 `0.5 * delta_z_strength + 0.5 * delta_z_toughness` scalar label。这样不会在 SFT 和 RL
+之间偷偷改变优化目标。
+
+这里拟合的是 conservative one-step action improvement，不是真正的24步 discounted Q return。
+所以 SFT checkpoint 提供的是动作排序先验，最终 Q calibration 仍由 DDQN TD learning 完成。
+
+### 7. SFT 训练、验证和进入 RL 的门槛
+
+SFT 数据必须按 sequence-similarity cluster 做 train/validation/test split，不能按 action row
+随机切分。否则同一个蛋白不同位置会同时进入训练和测试，指标会严重虚高。
+
+held-out proteins 上至少记录：
+
+```text
+Spearman(Q, reward_lcb)
+positive@1 / positive@5 / positive@10
+top-5% and top-10% hit rate
+enrichment factor and NDCG
+greedy regret = max_a reward_lcb(s,a) - reward_lcb(s,argmax Q)
+greedy action reward mean/median and bootstrap CI
+strength/toughness delta and Pareto-positive fraction
+```
+
+建议满足以下条件后再进入长期 RL：
+
+```text
+greedy positive@1 的 bootstrap lower CI 高于 random-action baseline；
+top-10% enrichment factor 至少明显大于1，并以2作为有价值的初始目标；
+greedy selected action 的 mean reward LCB 不为负；
+收益能在未见 sequence clusters 上复现，而不是只在 SFT train proteins 上出现。
+```
+
+若 SFT train loss 很低但这些 held-out 指标无效，说明问题不是 RL 探索技巧，而是 reward
+不可重复、状态不可识别或数据泄漏；此时不应继续扩大 SFT 数据。
+
+### 8. SFT checkpoint 接入 DDQN
+
+SFT checkpoint 必须记录 ESM2 model/version、embedding dimension、hidden dims、visited-mask
+配置、action mapping、reward scale 和数据 manifest hash。接入时：
+
+1. 使用相同的 `QNetwork` 配置实例化 online network；
+2. 加载 SFT Q-head 参数；
+3. 将 online 参数完整复制到 target network；
+4. 新建 optimizer，不加载 SFT optimizer momentum；
+5. environment/optimization step 从0开始；
+6. 前若干 optimizer steps 使用较低 learning rate 或 warmup，防止 TD loss 立即抹掉排序先验；
+7. 可在早期保留一个逐渐衰减的 ranking auxiliary loss，随后完全交给 DDQN。
+
+第一轮对照只改变初始化：
+
+```text
+A：random Q initialization + current DDQN
+B：SFT Q initialization + current DDQN，其他参数全部相同
+```
+
+只有 B 在固定 environment steps 下显著优于 A 后，才增加 demonstration replay 或 guided
+exploration，避免无法判断收益究竟来自 SFT、采样还是 epsilon 策略。
+
+第二轮可测试：
+
+```text
+C：SFT initialization + 5%至10% high-confidence demonstration replay
+D：SFT initialization + annealed SFT proposal / online-Q mixture
+```
+
+demonstration 必须是 episode/state 去重后的 positive-LCB 数据，并同时保留 hard negatives；不能
+重新退化为上一版“重复抽取 point-positive terminal rows”的策略。
+
+### 9. 在线评估设计
+
+四组实验使用完全相同的 protein order、PyRosetta seeds、environment-step budget 和固定 greedy
+validation：
+
+```text
+random-init DDQN
+SFT only（不做 RL，用于测量监督策略上界）
+SFT-init DDQN
+SFT-init DDQN + demonstration/auxiliary loss（第二阶段）
+```
+
+主要指标不是 training loss，而是：
+
+```text
+首次达到 positive validation mean/median 的 environment steps；
+validation terminal reward vs environment steps 的 AUC；
+positive fraction、strength/toughness mean/median 和 bootstrap CI；
+不同 mutation depth 上的 reward trajectory；
+动作多样性、重复位置率和 predictor OOD fraction。
+```
+
+至少运行3个 training seeds。只有 SFT-init 在 held-out fixed greedy validation 上更早达到正值、
+最终 CI 更高，才能说明它缓解了奖励稀疏，而不是仅让训练 replay reward 看起来更好。
+
+### 10. 主要风险及对应控制
+
+```text
+只优化 RF 代理：加入 feature-range/OOD 约束，并人工检查 top candidates。
+结构噪声：用 paired repeated relax LCB，而不是 point reward。
+只会第一步：通过多轮中间状态数据聚合解决。
+模型只记蛋白：sequence-cluster split，按 protein/state 等权。
+只学正样本：加入 hard negative、near-zero、failure 和 listwise ranking。
+ESM2 过滤漏掉机械突变：先在全19替换 pilot 上测 positive recall。
+Q 尺度与 long-horizon return 不一致：Huber/clip 控制尺度，随后由 TD 微调校准。
+SFT 被在线训练快速遗忘：optimizer 重置、LR warmup、短期衰减 auxiliary ranking loss。
+```
+
+当前 Q head 只显式接收 ESM2 sequence embedding 和 visited flag，而 mechanical predictor 依赖
+氢键/拓扑结构特征。如果结构 probe 能识别正动作、ESM2 probe 不能，下一版模型应把当前结构的
+七个归一化特征、当前 predicted strength/toughness、remaining horizon 等作为全局 context
+broadcast 到 residue head。SFT 不能从输入中恢复根本不存在且与序列不唯一对应的信息。
+
+### 11. 推荐执行顺序
+
+```text
+1. 等待当前 repeated-relax LCB pilot，确认 positive-LCB density 和重复性。
+2. 在同一24蛋白面板上训练最小 action-ranking probe，验证 ESM2 observation 的可识别性。
+3. 若 probe 有效，扩展至512个 sequence-cluster 分层蛋白并训练 SFT-v0。
+4. 用 held-out cluster 的 positive@k、EF、regret 和实际 PyRosetta greedy rollout 验收。
+5. 通过验收后收集 depth 1/2/4/8 中间状态，训练 SFT-v1。
+6. 先做 random-init DDQN vs SFT-init DDQN 的单变量对照。
+7. 只有 SFT 初始化有效但在线遗忘明显时，再引入 demonstration replay/auxiliary ranking。
+```
+
+最终判断：该方案值得做，但决定成败的不是“正样本数量足够多”，而是正动作是否具有统计可重复
+性、是否在蛋白级独立测试集上可排序、以及训练数据是否覆盖 RL 真正访问的多突变状态。按上述
+门槛分阶段推进，可以在投入约1410万次全量结构计算前尽早识别方案是否成立。

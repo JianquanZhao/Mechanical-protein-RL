@@ -59,6 +59,11 @@ def test_add_and_sample_shapes() -> None:
     assert batch.action_masks is not None and batch.action_masks.shape == (3, 4)
     assert batch.next_action_masks is not None and batch.next_action_masks.shape == (3, 4)
     assert batch.indices.shape == (3,)
+    assert batch.n_steps is not None and batch.n_steps.shape == (3,)
+    assert batch.terminal_reward_lcbs is not None
+    assert batch.episode_ids is not None
+    assert batch.importance_weights is not None
+    np.testing.assert_array_equal(batch.importance_weights, np.ones(3, dtype=np.float32))
 
 
 def test_default_masks_are_all_true() -> None:
@@ -78,6 +83,37 @@ def test_done_is_inferred_from_terminated_or_truncated() -> None:
     buffer.add(**make_transition(1.0, truncated=True))
     batch = buffer.sample(2)
     assert np.all(batch.dones)
+
+
+def test_terminal_outcome_diagnostics_cover_replay_top_priority_and_sample() -> None:
+    buffer = ReplayBuffer(
+        capacity=10,
+        state_shape=(3,),
+        action_dim=4,
+        sampling_strategy="prioritized",
+        priority_alpha=1.0,
+        seed=4,
+    )
+    for index, terminal_reward in enumerate((1.0, -2.0, None, 3.0)):
+        buffer.add(
+            **make_transition(float(index), truncated=terminal_reward is not None),
+            terminal_reward=terminal_reward,
+            terminal_strength_delta=terminal_reward,
+            terminal_toughness_delta=(
+                None if terminal_reward is None else -terminal_reward
+            ),
+        )
+    buffer.update_priorities([0, 1, 2, 3], [1.0, 20.0, 2.0, 3.0])
+
+    replay = buffer.terminal_outcome_diagnostics()
+    top = buffer.terminal_outcome_diagnostics(top_priority_fraction=0.01)
+    sampled = buffer.terminal_outcome_diagnostics(indices=[0, 1])
+
+    assert replay["terminal_count"] == 3
+    assert replay["terminal_reward_positive_fraction"] == pytest.approx(2 / 3)
+    assert replay["toughness_negative_fraction"] == pytest.approx(2 / 3)
+    assert top["terminal_reward_negative_fraction"] == pytest.approx(1.0)
+    assert sampled["terminal_reward_positive_fraction"] == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize(
@@ -315,3 +351,244 @@ def test_variable_length_save_and_load_round_trip(tmp_path: Path) -> None:
     batch = restored.sample(1)
     assert batch.states.shape == (1, 2, 4)
     assert batch.action_masks is not None and batch.action_masks.shape == (1, 40)
+
+
+def test_prioritized_sampling_favors_large_td_error() -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(3,),
+        action_dim=4,
+        seed=13,
+        sampling_strategy="prioritized",
+        priority_alpha=1.0,
+    )
+    for index in range(3):
+        buffer.add(**make_transition(float(index), action=index))
+    buffer.update_priorities(
+        np.asarray([0, 1, 2]),
+        np.asarray([0.01, 0.01, 10.0]),
+    )
+
+    sampled = [int(buffer.sample(1).indices[0]) for _ in range(500)]
+
+    assert sampled.count(2) > 480
+
+
+def test_prioritized_batch_has_normalized_importance_weights() -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(3,),
+        action_dim=4,
+        seed=17,
+        sampling_strategy="prioritized",
+    )
+    for index in range(4):
+        buffer.add(**make_transition(float(index), action=index))
+    buffer.update_priorities(np.arange(4), np.asarray([0.1, 0.5, 1.0, 5.0]))
+
+    batch = buffer.sample(4, beta=0.7)
+
+    assert batch.importance_weights is not None
+    assert np.all(batch.importance_weights > 0.0)
+    assert np.max(batch.importance_weights) == pytest.approx(1.0)
+    assert batch.sampling_probabilities is not None
+    assert batch.priority_beta == pytest.approx(0.7)
+
+
+def test_positive_stratified_sampling_enforces_batch_quota() -> None:
+    buffer = ReplayBuffer(
+        capacity=20,
+        state_shape=(3,),
+        action_dim=4,
+        seed=29,
+        sampling_strategy="prioritized",
+        positive_sample_fraction=0.25,
+    )
+    for index in range(20):
+        terminal_reward = 1.0 if index < 4 else -1.0
+        buffer.add(
+            **make_transition(float(index), action=index % 4),
+            terminal_reward=terminal_reward,
+        )
+
+    batch = buffer.sample(128, replace=True, beta=1.0)
+
+    assert batch.terminal_rewards is not None
+    assert np.count_nonzero(batch.terminal_rewards > 0.0) == 32
+    assert batch.importance_weights is not None
+    np.testing.assert_allclose(batch.importance_weights, np.ones(128))
+    assert batch.sampling_probabilities is not None
+    positive_probabilities = batch.sampling_probabilities[
+        batch.terminal_rewards > 0.0
+    ]
+    negative_probabilities = batch.sampling_probabilities[
+        batch.terminal_rewards <= 0.0
+    ]
+    np.testing.assert_allclose(positive_probabilities, 0.25 / 4)
+    np.testing.assert_allclose(negative_probabilities, 0.75 / 16)
+
+
+def test_positive_replay_reserve_protects_rows_after_buffer_is_full() -> None:
+    buffer = ReplayBuffer(
+        capacity=10,
+        state_shape=(3,),
+        action_dim=4,
+        seed=31,
+        positive_replay_reserve_fraction=0.4,
+    )
+    for index in range(10):
+        buffer.add(
+            **make_transition(float(index), action=index % 4),
+            terminal_reward=-1.0,
+        )
+    for index in range(4):
+        buffer.add(
+            **make_transition(float(10 + index), action=index % 4),
+            terminal_reward=1.0,
+        )
+    for index in range(40):
+        buffer.add(
+            **make_transition(float(20 + index), action=index % 4),
+            terminal_reward=-1.0,
+        )
+
+    assert buffer.positive_count == 4
+    assert buffer.positive_fraction == pytest.approx(0.4)
+    diagnostics = buffer.terminal_outcome_diagnostics()
+    assert diagnostics["positive_terminal_count"] == 4
+    assert diagnostics["positive_terminal_fraction"] == pytest.approx(0.4)
+
+
+def test_positive_replay_falls_back_when_positive_pool_is_empty() -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(3,),
+        action_dim=4,
+        seed=37,
+        positive_sample_fraction=0.5,
+    )
+    for index in range(4):
+        buffer.add(**make_transition(float(index), action=index))
+
+    batch = buffer.sample(4)
+
+    assert len(set(batch.indices.tolist())) == 4
+    assert batch.terminal_rewards is not None
+    assert np.all(np.isnan(batch.terminal_rewards))
+
+
+def test_positive_sampling_uses_lcb_and_deduplicates_episodes() -> None:
+    buffer = ReplayBuffer(
+        capacity=40,
+        state_shape=(3,),
+        action_dim=4,
+        seed=43,
+        positive_sample_fraction=0.25,
+        positive_reward_threshold=0.1,
+    )
+    for episode_id in range(6):
+        for offset in range(3):
+            buffer.add(
+                **make_transition(float(episode_id * 3 + offset)),
+                terminal_reward=1.0,
+                terminal_reward_lcb=0.2,
+                episode_id=episode_id,
+            )
+    for index in range(22):
+        buffer.add(
+            **make_transition(float(20 + index)),
+            terminal_reward=1.0,
+            terminal_reward_lcb=-0.1,
+            episode_id=100 + index,
+        )
+
+    batch = buffer.sample(16)
+    assert batch.terminal_reward_lcbs is not None
+    assert batch.episode_ids is not None
+    positive = batch.terminal_reward_lcbs > 0.1
+
+    assert int(positive.sum()) == 4
+    assert np.unique(batch.episode_ids[positive]).size == 4
+    diagnostics = buffer.terminal_outcome_diagnostics(indices=batch.indices)
+    assert diagnostics["positive_unique_episode_count"] == 4
+    assert diagnostics["positive_episode_duplicate_fraction"] == pytest.approx(0.0)
+
+
+def test_point_positive_below_lcb_boundary_is_not_positive() -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(3,),
+        action_dim=4,
+        seed=47,
+        positive_sample_fraction=0.5,
+        positive_reward_threshold=0.1,
+    )
+    buffer.add(
+        **make_transition(0.0),
+        terminal_reward=1.0,
+        terminal_reward_lcb=-0.1,
+        episode_id=0,
+    )
+    buffer.add(
+        **make_transition(1.0),
+        terminal_reward=0.5,
+        terminal_reward_lcb=0.2,
+        episode_id=1,
+    )
+
+    assert buffer.positive_count == 1
+    diagnostics = buffer.terminal_outcome_diagnostics()
+    assert diagnostics["positive_terminal_count"] == 1
+    assert diagnostics["positive_reward_lower_bound"] == pytest.approx(0.1)
+
+
+def test_prioritized_replay_snapshot_preserves_priorities_and_n_steps(tmp_path: Path) -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(3,),
+        action_dim=4,
+        seed=19,
+        sampling_strategy="prioritized",
+    )
+    buffer.add(**make_transition(0.0), n_steps=3)
+    buffer.update_priorities(np.asarray([0]), np.asarray([2.5]))
+
+    path = tmp_path / "prioritized.npz"
+    buffer.save(path)
+    restored = ReplayBuffer.load(path)
+
+    assert restored.sampling_strategy == "prioritized"
+    assert restored._priorities[0] == pytest.approx(2.5 + restored.priority_epsilon)
+    assert restored._n_steps[0] == 3
+
+
+def test_snapshot_preserves_positive_replay_configuration(tmp_path: Path) -> None:
+    buffer = ReplayBuffer(
+        capacity=4,
+        state_shape=(3,),
+        action_dim=4,
+        seed=41,
+        sampling_strategy="prioritized",
+        positive_sample_fraction=0.5,
+        positive_replay_reserve_fraction=0.25,
+        positive_reward_threshold=0.2,
+    )
+    buffer.add(
+        **make_transition(0.0),
+        terminal_reward=0.5,
+        terminal_reward_lcb=0.3,
+        episode_id=7,
+    )
+    buffer.add(**make_transition(1.0), terminal_reward=0.1)
+
+    path = tmp_path / "positive_replay.npz"
+    buffer.save(path)
+    restored = ReplayBuffer.load(path)
+
+    assert restored.positive_sample_fraction == pytest.approx(0.5)
+    assert restored.positive_replay_reserve_fraction == pytest.approx(0.25)
+    assert restored.positive_reward_threshold == pytest.approx(0.2)
+    assert restored.positive_count == 1
+    assert restored.positive_fraction == pytest.approx(0.5)
+    assert restored._terminal_reward_lcbs[0] == pytest.approx(0.3)
+    assert restored._episode_ids[0] == 7

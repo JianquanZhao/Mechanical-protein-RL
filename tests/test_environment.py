@@ -89,6 +89,23 @@ class FakeTerminalRewardCalculator:
         )
 
 
+class FakeImprovementTerminalRewardCalculator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def evaluate_episode(self, *, relaxed_pose, initial_pose, source_pdb_path=None):
+        initial_sequence = "".join(initial_pose.sequence)
+        final_sequence = "".join(relaxed_pose.sequence)
+        self.calls.append((initial_sequence, final_sequence, source_pdb_path))
+        return SimpleNamespace(
+            reward=1.25,
+            to_dict=lambda: {
+                "initial_sequence": initial_sequence,
+                "final_sequence": final_sequence,
+            },
+        )
+
+
 def make_env(**kwargs) -> MechanicalProteinEnv:
     backend = kwargs.pop("backend", FakeBackend())
     return MechanicalProteinEnv(
@@ -268,6 +285,25 @@ def test_last_step_adds_terminal_reward() -> None:
         env.step(action_for(env, 1, "A"))
 
 
+def test_last_step_scales_initial_to_final_terminal_reward() -> None:
+    calculator = FakeImprovementTerminalRewardCalculator()
+    env = make_env(
+        max_steps=1,
+        terminal_reward_calculator=calculator,
+        terminal_reward_scale=8.0,
+    )
+    env.reset()
+
+    _, reward, _, truncated, info = env.step(action_for(env, 0, "G"))
+
+    assert truncated is True
+    assert calculator.calls == [("ACD", "GCD", "fake.pdb")]
+    assert info["terminal_reward"] == pytest.approx(10.0)
+    assert reward == pytest.approx(12.5)
+    assert info["terminal_reward_metrics"]["initial_sequence"] == "ACD"
+    assert info["terminal_reward_metrics"]["final_sequence"] == "GCD"
+
+
 def test_action_mask_blocks_current_amino_acid_and_noop_is_penalized() -> None:
     env = make_env(invalid_action_penalty=-7.0)
     env.reset()
@@ -304,6 +340,23 @@ def test_prevent_revisit_masks_entire_position_after_mutation() -> None:
     _, reward, _, _, info = env.step(action_for(env, mutable_index=1, aa="A"))
     assert reward == pytest.approx(-4.0)
     assert info["reason"] == "position_already_mutated"
+
+
+def test_visited_mask_is_appended_to_per_residue_observation() -> None:
+    def encoder(_pose, env):
+        return np.zeros((env.n_mutable_positions, 1280), dtype=np.float32)
+
+    env = make_env(
+        prevent_revisit_positions=True,
+        include_visited_mask_in_observation=True,
+        observation_encoder=encoder,
+    )
+    observation, _ = env.reset()
+    assert observation.shape == (3, 1281)
+    np.testing.assert_array_equal(observation[:, -1], [0.0, 0.0, 0.0])
+
+    next_observation, *_ = env.step(action_for(env, mutable_index=1, aa="G"))
+    np.testing.assert_array_equal(next_observation[:, -1], [0.0, 1.0, 0.0])
 
 
 def test_update_failure_rolls_back_candidate_pose_when_configured() -> None:

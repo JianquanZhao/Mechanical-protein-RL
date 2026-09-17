@@ -7,8 +7,12 @@ Only compact, serializable transition data crosses process boundaries.
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
 import queue
+import signal
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -20,9 +24,61 @@ import torch
 
 from model.agent_module.ddqn_agent import AMINO_ACID_ACTION_DIM, QNetwork
 from model.environment_module.environment import MechanicalProteinEnv
+from model.replay_buffer_module import terminal_outcome_fields
 
 
 LOGGER = logging.getLogger(__name__)
+
+_PR_SET_PDEATHSIG = 1
+
+
+class LearnerProcessExited(RuntimeError):
+    """Raised when an asynchronous worker is no longer owned by its learner."""
+
+
+class WorkerParentGuard:
+    """Stop a worker promptly if its learner process disappears.
+
+    Linux workers additionally ask the kernel to deliver ``SIGTERM`` when their
+    parent dies. The explicit PPID checks provide race detection at startup and
+    a portable fallback at worker loop boundaries.
+    """
+
+    def __init__(self, learner_pid: Optional[int]) -> None:
+        self.learner_pid = None if learner_pid is None else int(learner_pid)
+
+    def arm(self) -> None:
+        if self.learner_pid is None:
+            return
+        self.check()
+        if sys.platform.startswith("linux"):
+            libc = ctypes.CDLL(None, use_errno=True)
+            result = libc.prctl(
+                _PR_SET_PDEATHSIG,
+                int(signal.SIGTERM),
+                0,
+                0,
+                0,
+            )
+            if result != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(
+                    error_number,
+                    "Failed to configure worker parent-death signal",
+                )
+        # Close the race where the learner exits between the first PPID check
+        # and installation of PR_SET_PDEATHSIG.
+        self.check()
+
+    def check(self) -> None:
+        if self.learner_pid is None:
+            return
+        actual_parent_pid = os.getppid()
+        if actual_parent_pid != self.learner_pid:
+            raise LearnerProcessExited(
+                "Learner process is no longer the worker parent: "
+                f"expected_ppid={self.learner_pid} actual_ppid={actual_parent_pid}."
+            )
 
 
 @dataclass(frozen=True)
@@ -125,10 +181,13 @@ def run_esm_inference_worker(
     batch_size: int,
     batch_wait_ms: float,
     encoder_factory: Optional[Callable[..., Any]] = None,
+    learner_pid: Optional[int] = None,
 ) -> None:
     """Load one ESM2 replica and dynamically batch requests from all actors."""
 
+    parent_guard = WorkerParentGuard(learner_pid)
     try:
+        parent_guard.arm()
         if str(device).startswith("cuda"):
             torch.cuda.set_device(torch.device(device))
         factory = _load_esm_encoder if encoder_factory is None else encoder_factory
@@ -142,9 +201,11 @@ def run_esm_inference_worker(
         )
 
         while not stop_event.is_set():
+            parent_guard.check()
             try:
                 first = request_queue.get(timeout=0.2)
             except queue.Empty:
+                parent_guard.check()
                 continue
             if first is None:
                 break
@@ -152,6 +213,7 @@ def run_esm_inference_worker(
             requests = [first]
             deadline = time.monotonic() + max(0.0, float(batch_wait_ms)) / 1000.0
             while len(requests) < int(batch_size):
+                parent_guard.check()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -165,6 +227,7 @@ def run_esm_inference_worker(
                 requests.append(request)
 
             try:
+                parent_guard.check()
                 embeddings = encoder.encode_sequences(
                     [request.sequence for request in requests]
                 )
@@ -182,12 +245,19 @@ def run_esm_inference_worker(
                 raise
 
             for request, embedding in zip(requests, embeddings):
+                parent_guard.check()
                 response_queues[request.client_id].put(
                     InferenceResponse(
                         request.request_id,
                         embedding=np.asarray(embedding, dtype=np.float32),
                     )
                 )
+    except LearnerProcessExited:
+        LOGGER.warning(
+            "ESM2 worker %s is exiting because learner PID %s disappeared.",
+            worker_id,
+            learner_pid,
+        )
     except Exception:
         ready_queue.put(
             {
@@ -207,12 +277,18 @@ class ActorPolicy:
         self,
         *,
         embedding_dim: int,
+        state_feature_dim: Optional[int] = None,
         hidden_dims: Sequence[int],
         state_dict: Mapping[str, Any],
         seed: int,
     ) -> None:
+        state_feature_dim = (
+            int(embedding_dim)
+            if state_feature_dim is None
+            else int(state_feature_dim)
+        )
         self.network = QNetwork(
-            (1, int(embedding_dim)),
+            (1, state_feature_dim),
             AMINO_ACID_ACTION_DIM,
             hidden_dims=hidden_dims,
             embedding_dim=int(embedding_dim),
@@ -278,12 +354,11 @@ def _build_actor_environment(
     terminal_reward_calculator = None
     if not bool(config["no_terminal_reward"]):
         from model.reward_module.terminal_reward import (
-            EqualWeightDualStructureTerminalRewardCalculator,
+            MechanicalImprovementTerminalRewardCalculator,
         )
 
-        terminal_reward_calculator = EqualWeightDualStructureTerminalRewardCalculator(
+        terminal_reward_calculator = MechanicalImprovementTerminalRewardCalculator(
             artifact_path=config["terminal_reward_artifact"],
-            predicted_pdb_dir=config["terminal_predicted_pdb_dir"],
         )
 
     return MechanicalProteinEnv(
@@ -294,6 +369,9 @@ def _build_actor_environment(
         perform_minimize=not bool(config["no_minimize"]),
         minimize_backbone=bool(config["minimize_backbone"]),
         prevent_revisit_positions=bool(config["prevent_revisit_positions"]),
+        include_visited_mask_in_observation=bool(
+            config.get("include_visited_mask_in_observation", False)
+        ),
         raise_on_update_error=bool(config["raise_on_update_error"]),
         step_reward_scale=float(config["step_reward_scale"]),
         terminal_reward_scale=float(config["terminal_reward_scale"]),
@@ -337,11 +415,14 @@ def actor_worker_main(
     inference_response_queue: Any,
     ready_queue: Any,
     stop_event: Any,
+    learner_pid: Optional[int] = None,
 ) -> None:
     """Collect complete episodes in one isolated PyRosetta process."""
 
     env: Optional[MechanicalProteinEnv] = None
+    parent_guard = WorkerParentGuard(learner_pid)
     try:
+        parent_guard.arm()
         torch.set_num_threads(max(1, int(config["actor_torch_threads"])))
         remote_encoder = RemoteESM2Encoder(
             client_id=int(actor_id),
@@ -353,6 +434,7 @@ def actor_worker_main(
         env = _build_actor_environment(config, remote_encoder)
         policy = ActorPolicy(
             embedding_dim=int(config["embedding_dim"]),
+            state_feature_dim=int(config["state_feature_dim"]),
             hidden_dims=tuple(config["hidden_dims"]),
             state_dict=initial_policy_state,
             seed=int(config["seed"]) + int(actor_id) * 1009,
@@ -363,9 +445,11 @@ def actor_worker_main(
         ready_queue.put({"kind": "actor_ready", "actor_id": int(actor_id)})
 
         while not stop_event.is_set():
+            parent_guard.check()
             try:
                 task = task_queue.get(timeout=0.2)
             except queue.Empty:
+                parent_guard.check()
                 continue
             if task is None:
                 break
@@ -380,21 +464,32 @@ def actor_worker_main(
 
             episode = int(task["episode"])
             pdb_path = str(task["pdb_path"])
+            task_kind = str(task.get("kind", "train"))
+            is_validation = task_kind == "validation"
+            if task_kind not in ("train", "validation"):
+                raise ValueError(f"Unknown actor task kind: {task_kind!r}.")
             started = time.perf_counter()
-            state, info = env.reset(pdb_path=pdb_path)
+            state, info = env.reset(
+                pdb_path=pdb_path,
+                seed=None if task.get("seed") is None else int(task["seed"]),
+            )
             episode_reward = 0.0
             episode_step = 0
 
             while not stop_event.is_set():
-                snapshot = _latest_policy_snapshot(policy_queue)
-                if snapshot is not None:
-                    policy.update(snapshot["state_dict"], version=snapshot["version"])
-                    estimated_global_step = max(
-                        estimated_global_step,
-                        int(snapshot["environment_steps"]),
-                    )
+                parent_guard.check()
+                if not is_validation:
+                    snapshot = _latest_policy_snapshot(policy_queue)
+                    if snapshot is not None:
+                        policy.update(snapshot["state_dict"], version=snapshot["version"])
+                        estimated_global_step = max(
+                            estimated_global_step,
+                            int(snapshot["environment_steps"]),
+                        )
 
-                epsilon = epsilon_at_step(config, estimated_global_step)
+                epsilon = 0.0 if is_validation else epsilon_at_step(
+                    config, estimated_global_step
+                )
                 action_mask = np.asarray(info["action_mask"], dtype=np.bool_)
                 action = policy.select_action(
                     state,
@@ -402,38 +497,67 @@ def actor_worker_main(
                     epsilon=epsilon,
                 )
                 next_state, reward, terminated, truncated, next_info = env.step(action)
-                event_queue.put(
-                    {
-                        "kind": "transition",
-                        "actor_id": int(actor_id),
-                        "episode": episode,
-                        "episode_step": episode_step,
-                        "state": state,
-                        "action": int(action),
-                        "reward": float(reward),
-                        "next_state": next_state,
-                        "terminated": bool(terminated),
-                        "truncated": bool(truncated),
-                        "action_mask": action_mask,
-                        "next_action_mask": np.asarray(
-                            next_info["action_mask"], dtype=np.bool_
-                        ),
-                        "info": next_info,
-                        "epsilon": epsilon,
-                        "policy_version": policy.version,
-                    },
-                    timeout=float(config["async_timeout_seconds"]),
+                parent_guard.check()
+                terminal_fields = terminal_outcome_fields(
+                    next_info,
+                    done=bool(terminated or truncated),
                 )
+                if not is_validation:
+                    event_queue.put(
+                        {
+                            "kind": "transition",
+                            "actor_id": int(actor_id),
+                            "episode": episode,
+                            "episode_step": episode_step,
+                            "state": state,
+                            "action": int(action),
+                            "reward": float(reward),
+                            "next_state": next_state,
+                            "terminated": bool(terminated),
+                            "truncated": bool(truncated),
+                            "action_mask": action_mask,
+                            "next_action_mask": np.asarray(
+                                next_info["action_mask"], dtype=np.bool_
+                            ),
+                            "info": next_info,
+                            "epsilon": epsilon,
+                            "policy_version": policy.version,
+                            **terminal_fields,
+                        },
+                        timeout=float(config["async_timeout_seconds"]),
+                    )
                 state = next_state
                 info = next_info
                 episode_reward += float(reward)
                 episode_step += 1
-                estimated_global_step += int(actor_count)
+                if not is_validation:
+                    estimated_global_step += int(actor_count)
                 if terminated or truncated:
                     break
 
             if stop_event.is_set():
                 break
+            if is_validation:
+                terminal_fields = terminal_outcome_fields(info, done=True)
+                event_queue.put(
+                    {
+                        "kind": "validation",
+                        "actor_id": int(actor_id),
+                        "validation_run": int(task["validation_run"]),
+                        "validation_index": int(task["validation_index"]),
+                        "trigger_episode": int(task["trigger_episode"]),
+                        "pdb_path": pdb_path,
+                        "seed": int(task["seed"]),
+                        "total_reward": float(episode_reward),
+                        "episode_steps": int(episode_step),
+                        "policy_version": int(policy.version),
+                        "info": info,
+                        "elapsed_seconds": time.perf_counter() - started,
+                        **terminal_fields,
+                    },
+                    timeout=float(config["async_timeout_seconds"]),
+                )
+                continue
             candidate_path = None
             if bool(config["save_candidates"]):
                 candidate_path = (
@@ -465,6 +589,12 @@ def actor_worker_main(
                 },
                 timeout=float(config["async_timeout_seconds"]),
             )
+    except LearnerProcessExited:
+        LOGGER.warning(
+            "Actor %s is exiting because learner PID %s disappeared.",
+            actor_id,
+            learner_pid,
+        )
     except Exception:
         event_queue.put(
             {

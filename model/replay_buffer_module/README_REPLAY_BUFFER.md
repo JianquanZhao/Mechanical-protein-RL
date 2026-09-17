@@ -1,4 +1,4 @@
-# DDQN Uniform Replay Buffer
+# DDQN Replay Buffer
 
 ## Project structure
 
@@ -37,6 +37,48 @@ buffer = ReplayBuffer(
 )
 ```
 
+Uniform replay remains the default. The training entry point can additionally
+combine TD-error PER with a positive-terminal stratum:
+
+```python
+buffer = ReplayBuffer(
+    capacity=100_000,
+    state_shape=observation.shape,
+    action_dim=env.action_space.n,
+    sampling_strategy="prioritized",
+    positive_sample_fraction=0.25,
+    positive_replay_reserve_fraction=0.10,
+    # Internal API keeps this compatibility name; CLI uses
+    # --positive-reward-lower-bound.
+    positive_reward_threshold=0.0,
+)
+```
+
+A terminal episode enters the positive stratum only when its propagated
+`terminal_reward_lcb` is finite and greater than
+`positive_reward_threshold`. If no empirical LCB is supplied, the point
+terminal reward is used as a fallback, so the threshold acts as a minimum
+effect/noise boundary. With n-step replay this includes terminal-bearing
+prefixes, not ordinary transitions with a positive local shaping reward.
+
+`positive_sample_fraction` sets the target positive quota in each batch. The
+sampler first collapses terminal-bearing n-step rows to one representative per
+known `episode_id`, then applies PER by absolute TD error within the positive
+and remaining strata. This prevents one successful episode from filling the
+positive quota several times. Importance weights correct the within-stratum
+PER bias while preserving the intentional positive quota.
+
+`positive_replay_reserve_fraction` changes eviction only after the buffer is
+full: once enough positive rows have arrived, negative insertions cannot reduce
+their retained transition fraction below the configured reserve. No ESM state
+is duplicated, so this policy does not increase replay capacity or state-memory
+allocation.
+
+The `ReplayBuffer` API keeps zero as its conservative standalone default; the
+training CLI defaults `--positive-sample-fraction` to `0.25`. Useful diagnostics
+include `positive_count`, `positive_fraction`,
+`positive_unique_episode_count`, and `positive_episode_duplicate_fraction`.
+
 ## Add one transition
 
 ```python
@@ -49,6 +91,9 @@ buffer.add(
     truncated=truncated,
     action_mask=info["action_mask"],
     next_action_mask=next_info["action_mask"],
+    terminal_reward=terminal_reward,
+    terminal_reward_lcb=terminal_reward_lcb,
+    episode_id=episode_id,
 )
 ```
 

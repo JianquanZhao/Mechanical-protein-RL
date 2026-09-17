@@ -792,6 +792,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         perform_minimize: bool = True,
         minimize_backbone: bool = False,
         prevent_revisit_positions: bool = False,
+        include_visited_mask_in_observation: bool = False,
         invalid_action_penalty: float = -5.0,
         update_error_penalty: float = -10.0,
         raise_on_update_error: bool = True,
@@ -839,6 +840,14 @@ class MechanicalProteinEnv(_GymEnvBase):
         self.perform_minimize = bool(perform_minimize)
         self.minimize_backbone = bool(minimize_backbone)
         self.prevent_revisit_positions = bool(prevent_revisit_positions)
+        self.include_visited_mask_in_observation = bool(
+            include_visited_mask_in_observation
+        )
+        if self.include_visited_mask_in_observation and not self.prevent_revisit_positions:
+            raise ValueError(
+                "include_visited_mask_in_observation requires "
+                "prevent_revisit_positions=True."
+            )
         self.invalid_action_penalty = float(invalid_action_penalty)
         self.update_error_penalty = float(update_error_penalty)
         self.raise_on_update_error = bool(raise_on_update_error)
@@ -1035,6 +1044,24 @@ class MechanicalProteinEnv(_GymEnvBase):
                 self.observation_encoder(self.current_pose, self),
                 dtype=np.float32,
             )
+
+        if self.include_visited_mask_in_observation:
+            if array.ndim != 2 or array.shape[0] != self.n_mutable_positions:
+                raise ValueError(
+                    "Visited-mask observations require a per-residue encoder with "
+                    "one row per mutable position; "
+                    f"got observation shape {array.shape} for "
+                    f"{self.n_mutable_positions} mutable positions."
+                )
+            visited = np.fromiter(
+                (
+                    1.0 if position in self.visited_positions else 0.0
+                    for position in self.mutable_positions
+                ),
+                dtype=np.float32,
+                count=self.n_mutable_positions,
+            ).reshape(-1, 1)
+            array = np.concatenate((array, visited), axis=1)
 
         if array.size == 0:
             raise ValueError("Observation encoder returned an empty array.")
@@ -1392,6 +1419,7 @@ class MechanicalProteinEnv(_GymEnvBase):
         if hasattr(self.terminal_reward_calculator, "evaluate_episode"):
             result = self.terminal_reward_calculator.evaluate_episode(
                 relaxed_pose=self.current_pose,
+                initial_pose=self.reference_pose,
                 source_pdb_path=self.initial_pdb_path,
             )
         else:

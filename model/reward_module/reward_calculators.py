@@ -210,18 +210,23 @@ class StepRewardCalculator:
 
     Reward formula
     --------------
-    Each raw term is first converted to a bounded 0..1 score, then averaged by
-    term weights:
+    Each raw term is retained as a bounded 0..1 diagnostic score, then centered
+    before scalarization:
 
         collision_score       = 1 - clip(collision_loss / collision_scale, 0, 1)
         backbone_hbond_score  = 0.5 + 0.5 * tanh(delta backbone H-bonds / scale)
         sidechain_hbond_score = 0.5 + 0.5 * tanh(delta sidechain H-bonds / scale)
         local_rmsd_score      = 1 - clip(local RMSD / local_rmsd_scale, 0, 1)
 
-        reward = weighted_mean(term_scores)
+        centered_collision = collision_score - 1
+        centered_hbond = 2 * hbond_score - 1
+        centered_rmsd = local_rmsd_score - 1
+        reward = weighted_mean(centered_terms)
 
-    This keeps step rewards in 0..1 so the steric energy term does not dominate
-    the early base-version training signal.
+    No collision/RMSD penalty and no H-bond change therefore map to zero.
+    Positive shaping requires an H-bond improvement, while structural penalties
+    are non-positive. The environment applies a separate small scale so an
+    episode of shaping cannot dominate the mechanical terminal objective.
 
     Recommended environment order
     -----------------------------
@@ -720,11 +725,25 @@ class StepRewardCalculator:
             "sidechain_hbond": self._delta_to_unit_score(sidechain_delta, self.scales.sidechain_hbond),
             "local_rmsd": self._penalty_to_unit_score(local_rmsd_used, self.scales.local_rmsd),
         }
-        weighted_components = {
-            "collision": self.weights.collision * components["collision"],
-            "backbone_hbond": self.weights.backbone_hbond * components["backbone_hbond"],
-            "sidechain_hbond": self.weights.sidechain_hbond * components["sidechain_hbond"],
-            "local_rmsd": self.weights.local_rmsd * components["local_rmsd"],
+        centered_components = {
+            "collision": self._penalty_to_centered_score(
+                collision_loss, self.scales.collision
+            ),
+            "backbone_hbond": self._delta_to_centered_score(
+                backbone_delta, self.scales.backbone_hbond
+            ),
+            "sidechain_hbond": self._delta_to_centered_score(
+                sidechain_delta, self.scales.sidechain_hbond
+            ),
+            "local_rmsd": self._penalty_to_centered_score(
+                local_rmsd_used, self.scales.local_rmsd
+            ),
+        }
+        weighted_centered_components = {
+            "collision": self.weights.collision * centered_components["collision"],
+            "backbone_hbond": self.weights.backbone_hbond * centered_components["backbone_hbond"],
+            "sidechain_hbond": self.weights.sidechain_hbond * centered_components["sidechain_hbond"],
+            "local_rmsd": self.weights.local_rmsd * centered_components["local_rmsd"],
         }
         total_weight = (
             self.weights.collision
@@ -736,7 +755,7 @@ class StepRewardCalculator:
             raise ValueError("At least one step reward weight must be positive.")
 
         return StepRewardResult(
-            reward=float(sum(weighted_components.values()) / total_weight),
+            reward=float(sum(weighted_centered_components.values()) / total_weight),
             collision_score=float(current_collision),
             previous_collision_score=float(previous_collision),
             reference_collision_score=float(self.reference_collision_score),
@@ -762,10 +781,14 @@ class StepRewardCalculator:
                 "backbone_hbond": float(components["backbone_hbond"]),
                 "sidechain_hbond": float(components["sidechain_hbond"]),
                 "local_rmsd": float(components["local_rmsd"]),
-                "weighted_collision": float(weighted_components["collision"]),
-                "weighted_backbone_hbond": float(weighted_components["backbone_hbond"]),
-                "weighted_sidechain_hbond": float(weighted_components["sidechain_hbond"]),
-                "weighted_local_rmsd": float(weighted_components["local_rmsd"]),
+                "centered_collision": float(centered_components["collision"]),
+                "centered_backbone_hbond": float(centered_components["backbone_hbond"]),
+                "centered_sidechain_hbond": float(centered_components["sidechain_hbond"]),
+                "centered_local_rmsd": float(centered_components["local_rmsd"]),
+                "weighted_collision": float(weighted_centered_components["collision"]),
+                "weighted_backbone_hbond": float(weighted_centered_components["backbone_hbond"]),
+                "weighted_sidechain_hbond": float(weighted_centered_components["sidechain_hbond"]),
+                "weighted_local_rmsd": float(weighted_centered_components["local_rmsd"]),
                 "weight_sum": float(total_weight),
             },
         )
@@ -784,6 +807,18 @@ class StepRewardCalculator:
 
         safe_scale = max(float(scale), np.finfo(float).eps)
         return float(0.5 + 0.5 * np.tanh(float(value) / safe_scale))
+
+    @classmethod
+    def _penalty_to_centered_score(cls, value: float, scale: float) -> float:
+        """Map no penalty to zero and increasing penalty into [-1, 0]."""
+
+        return float(cls._penalty_to_unit_score(value, scale) - 1.0)
+
+    @classmethod
+    def _delta_to_centered_score(cls, value: float, scale: float) -> float:
+        """Map no change to zero and signed changes into [-1, 1]."""
+
+        return float(2.0 * cls._delta_to_unit_score(value, scale) - 1.0)
 
 
 # ---------------------------------------------------------------------------

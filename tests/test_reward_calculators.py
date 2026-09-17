@@ -94,3 +94,11 @@ def test_delta_term_is_bounded_unit_score() -> None:
     assert StepRewardCalculator._delta_to_unit_score(0.0, 1.0) == pytest.approx(0.5)
     assert 0.5 < StepRewardCalculator._delta_to_unit_score(1.0, 1.0) <= 1.0
     assert 0.0 <= StepRewardCalculator._delta_to_unit_score(-1.0, 1.0) < 0.5
+
+
+def test_centered_step_terms_map_no_change_to_zero() -> None:
+    assert StepRewardCalculator._penalty_to_centered_score(0.0, 1.0) == 0.0
+    assert StepRewardCalculator._delta_to_centered_score(0.0, 1.0) == 0.0
+    assert StepRewardCalculator._penalty_to_centered_score(1.0, 1.0) < 0.0
+    assert StepRewardCalculator._delta_to_centered_score(1.0, 1.0) > 0.0
+    assert StepRewardCalculator._delta_to_centered_score(-1.0, 1.0) < 0.0

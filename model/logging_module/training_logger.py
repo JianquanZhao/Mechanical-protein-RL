@@ -167,6 +167,7 @@ class TrainingLogger:
         self.episodes_csv_path = self.logs_dir / "episodes.csv"
         self.optimization_jsonl_path = self.logs_dir / "optimization.jsonl"
         self.steps_jsonl_path = self.logs_dir / "steps.jsonl"
+        self.validation_jsonl_path = self.logs_dir / "validation_summary.jsonl"
 
         self.episode_records: List[Dict[str, Any]] = []
         self.optimization_records: List[Dict[str, Any]] = []
@@ -320,6 +321,8 @@ class TrainingLogger:
         terminal_reward = self._extract_terminal_reward(info)
         if terminal_reward is not None:
             record["terminal_reward"] = terminal_reward
+        mechanical_metrics = self._extract_mechanical_improvement_metrics(info)
+        record.update(mechanical_metrics)
 
         if "sequence" in info and info["sequence"] is not None:
             record["sequence"] = str(info["sequence"])
@@ -353,6 +356,12 @@ class TrainingLogger:
                 terminal_reward,
                 record["global_step"],
             )
+        for key, value in mechanical_metrics.items():
+            self._tensorboard_add_scalar(
+                f"mechanical/{key.removeprefix('mechanical_')}",
+                value,
+                record["global_step"],
+            )
 
         LOGGER.debug(
             "Logged step record episode=%s episode_step=%s global_step=%s reward=%.6f "
@@ -364,6 +373,29 @@ class TrainingLogger:
             record["done"],
             self.steps_jsonl_path,
         )
+        return record
+
+    def log_validation(
+        self,
+        summary: Mapping[str, Any],
+        *,
+        global_step: int,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist one fixed greedy-validation summary and emit TensorBoard scalars."""
+
+        record = self._numeric_json_safe_record(dict(summary))
+        record["global_step"] = self._coerce_nonnegative_int(
+            global_step, "global_step"
+        )
+        if extra:
+            record.update(self._json_safe_mapping(extra))
+        self._append_jsonl(self.validation_jsonl_path, record)
+        for key, value in record.items():
+            if key != "global_step" and self._is_number(value):
+                self._tensorboard_add_scalar(
+                    f"validation/{key}", float(value), record["global_step"]
+                )
         return record
 
     def end_episode(
@@ -411,6 +443,8 @@ class TrainingLogger:
                 terminal_reward,
                 "terminal_reward",
             )
+        mechanical_metrics = self._extract_mechanical_improvement_metrics(info)
+        record.update(mechanical_metrics)
 
         if "sequence" in info and info["sequence"] is not None:
             record["sequence"] = str(info["sequence"])
@@ -450,6 +484,12 @@ class TrainingLogger:
             self._tensorboard_add_scalar(
                 "episode/terminal_reward",
                 terminal_reward,
+                episode_value,
+            )
+        for key, value in mechanical_metrics.items():
+            self._tensorboard_add_scalar(
+                f"episode/{key}",
+                value,
                 episode_value,
             )
 
@@ -912,6 +952,43 @@ class TrainingLogger:
 
         return None
 
+    @classmethod
+    def _extract_mechanical_improvement_metrics(
+        cls,
+        info: Mapping[str, Any],
+    ) -> Dict[str, float]:
+        metrics = info.get("terminal_reward_metrics")
+        if not isinstance(metrics, Mapping):
+            return {}
+
+        extracted: Dict[str, float] = {}
+        direct_fields = {
+            "delta_normalized_strength": "mechanical_delta_strength_z",
+            "delta_normalized_toughness": "mechanical_delta_toughness_z",
+        }
+        for source_key, output_key in direct_fields.items():
+            value = metrics.get(source_key)
+            if cls._is_number(value):
+                extracted[output_key] = float(value)
+
+        for state_name in ("initial", "final"):
+            result = metrics.get(f"{state_name}_result")
+            if not isinstance(result, Mapping):
+                continue
+            for property_name in ("strength", "toughness"):
+                value = result.get(property_name)
+                if cls._is_number(value):
+                    extracted[
+                        f"mechanical_{state_name}_{property_name}"
+                    ] = float(value)
+                normalized_value = result.get(f"normalized_{property_name}")
+                if cls._is_number(normalized_value):
+                    extracted[
+                        f"mechanical_{state_name}_{property_name}_z"
+                    ] = float(normalized_value)
+
+        return extracted
+
     @staticmethod
     def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as file:
@@ -958,6 +1035,12 @@ class TrainingLogger:
             "epsilon",
             "optimization_steps",
             "terminal_reward",
+            "mechanical_delta_strength_z",
+            "mechanical_delta_toughness_z",
+            "mechanical_initial_strength",
+            "mechanical_final_strength",
+            "mechanical_initial_toughness",
+            "mechanical_final_toughness",
             "sequence",
         ]
 

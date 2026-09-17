@@ -118,6 +118,30 @@ def test_q_network_output_shape_and_single_state_support() -> None:
     assert network.embedding_dim == 1280
 
 
+def test_per_residue_q_network_accepts_visited_feature_channel() -> None:
+    network = QNetwork(
+        (1, 1281),
+        action_dim=20,
+        hidden_dims=(8,),
+        embedding_dim=1280,
+    )
+    assert network(torch.zeros(2, 4, 1281)).shape == (2, 80)
+
+
+def test_agent_accepts_variable_length_states_with_visited_feature_channel() -> None:
+    agent = DDQNAgent(
+        state_shape=(1, 1281),
+        action_dim=20,
+        config=make_config(hidden_dims=(8,), embedding_dim=1280),
+    )
+    state = np.zeros((3, 1281), dtype=np.float32)
+    mask = np.ones(60, dtype=np.bool_)
+
+    action = agent.select_action(state, action_mask=mask, evaluate=True)
+
+    assert 0 <= action < 60
+
+
 def test_q_network_rejects_wrong_state_shape() -> None:
     network = QNetwork((6,), action_dim=5, hidden_dims=(8,))
     with pytest.raises(ValueError, match="Expected trailing state shape"):
@@ -308,6 +332,67 @@ def test_double_dqn_target_uses_online_for_selection_target_for_evaluation() -> 
     # Row 1: online chooses action 0; target evaluates 40.
     expected = torch.tensor([1.0 + 0.5 * 30.0, 2.0 + 0.5 * 40.0])
     torch.testing.assert_close(actual, expected)
+
+
+def test_n_step_target_uses_gamma_to_actual_step_power() -> None:
+    online = LookupNetwork([[1.0, 2.0]])
+    target = LookupNetwork([[10.0, 20.0]])
+    agent = DDQNAgent(
+        state_shape=(1,),
+        action_dim=2,
+        config=make_config(gamma=0.5),
+        online_network=online,
+        target_network=target,
+    )
+
+    actual = agent.compute_ddqn_targets(
+        next_states=torch.tensor([[0.0]]),
+        rewards=torch.tensor([2.75]),
+        dones=torch.tensor([False]),
+        next_action_masks=torch.tensor([[True, True]]),
+        n_steps=torch.tensor([3.0]),
+    )
+
+    torch.testing.assert_close(actual, torch.tensor([2.75 + 0.5**3 * 20.0]))
+
+
+def test_prioritized_optimization_updates_replay_td_priorities() -> None:
+    from model.replay_buffer_module import ReplayBuffer
+
+    buffer = ReplayBuffer(
+        capacity=8,
+        state_shape=(2,),
+        action_dim=2,
+        seed=23,
+        sampling_strategy="prioritized",
+    )
+    mask = np.ones(2, dtype=np.bool_)
+    for index in range(4):
+        state = np.asarray([index, index + 1], dtype=np.float32)
+        buffer.add(
+            state=state,
+            action=index % 2,
+            reward=float(index),
+            next_state=state + 0.5,
+            truncated=index == 3,
+            action_mask=mask,
+            next_action_mask=mask,
+        )
+    agent = DDQNAgent(
+        state_shape=(2,),
+        action_dim=2,
+        config=make_config(
+            micro_batch_size=4,
+            gradient_accumulation_steps=1,
+            replay_warmup_size=4,
+        ),
+    )
+
+    result = agent.optimize_from_replay_buffer(buffer)
+
+    assert result is not None
+    assert result.absolute_td_errors is not None
+    assert not np.allclose(buffer._priorities[:4], 1.0)
 
 
 def test_terminal_row_accepts_all_false_next_action_mask() -> None:

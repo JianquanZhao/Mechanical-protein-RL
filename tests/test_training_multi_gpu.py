@@ -15,12 +15,37 @@ from training import (
     data_parallel_batch_plan,
     enable_data_parallel,
     load_resume_checkpoint,
+    parse_args,
     run_replay_optimization_event,
     save_agent_checkpoint,
     save_resume_checkpoint,
     should_run_optimizer_event,
     update_schedule_summary,
 )
+
+
+def test_cli_defaults_use_positive_episode_quota_and_weak_shaping(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["training.py"])
+
+    args = parse_args()
+
+    assert args.replay_sampling == "uniform"
+    assert args.positive_sample_fraction == pytest.approx(0.25)
+    assert args.positive_replay_reserve_fraction == pytest.approx(0.0)
+    assert args.positive_reward_threshold == pytest.approx(0.0)
+    assert args.n_step == 1
+    assert args.step_reward_scale == pytest.approx(0.025)
+
+
+def test_cli_accepts_positive_reward_lower_bound(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["training.py", "--positive-reward-lower-bound", "0.15"],
+    )
+
+    args = parse_args()
+
+    assert args.positive_reward_threshold == pytest.approx(0.15)
 
 
 def test_full_batch_shortcut_disables_gradient_accumulation() -> None:
