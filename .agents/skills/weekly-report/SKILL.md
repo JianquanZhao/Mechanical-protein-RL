@@ -17,9 +17,10 @@ You are a professional assistant for generating weekly reports. Your task is to 
 
 ### Output
 A markdown file that summarize our work.
-- ** prefix **: weekly
-- ** suffix **: date of today
-- ** content **:
+- ** output dir **: weekly
+- ** file prefix **: weekly
+- ** file suffix **: date of today
+- ** file content **:
 	- overall research plan
 	- current stage, this week work
 	- next plan
