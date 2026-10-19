@@ -16,7 +16,22 @@ scan:
 statistics:
   confidence_level: 0.95
   bootstrap_samples: 200
-  positive_noise_boundary: 0.0
-  negative_noise_boundary: 0.0
+  positive_noise_boundary: 0.01
+  negative_noise_boundary: -0.01
   target_column: marginal_reward_scaled
 
+release:
+  source_split: train
+  fractions:
+    train: 0.60
+    validation: 0.20
+    test: 0.20
+  seed: 20260917
+  dead_zone_tau: 0.01
+  uncertain_weight: 0.25
+  chunk_size: 1000
+
+embedding_cache:
+  embedding_dim: 1280
+  dtype: float16
+  batch_size: 2

@@ -13,9 +13,10 @@ import yaml
 
 from .config import dataset_root, load_config
 from .contract import reward_contract
+from .embeddings import cache_state_embeddings
 from .manifest import prepare_manifest
 from .proposals import build_candidate_manifest
-from .release import create_release
+from .release import create_compact_release, create_release
 from .scan import merge_shards, scan_shard
 from .search import frontier_to_states, select_global_beam
 from .statistics import aggregate_file
@@ -81,7 +82,7 @@ def command_build_tasks(args: argparse.Namespace) -> None:
         output,
         repeat_seeds=repeat_seeds,
         reward_contract_hash=str(contract["reward_contract_hash"]),
-        split_names=args.split,
+        split_names=args.split or ["train"],
         candidate_actions_path=args.candidates,
     )
     _print({"task_count": len(tasks), "states": str(states), "tasks": str(output)})
@@ -190,6 +191,72 @@ def command_release(args: argparse.Namespace) -> None:
     _print(summary)
 
 
+def command_release_compact(args: argparse.Namespace) -> None:
+    config, root = _load(args)
+    settings = config["release"]
+    output = Path(args.output_dir).expanduser().resolve() if args.output_dir else root / "release" / args.release_name
+    fractions = {
+        "train": float(args.train_fraction if args.train_fraction is not None else settings["fractions"]["train"]),
+        "validation": float(
+            args.validation_fraction
+            if args.validation_fraction is not None
+            else settings["fractions"]["validation"]
+        ),
+        "test": float(args.test_fraction if args.test_fraction is not None else settings["fractions"]["test"]),
+    }
+    summary = create_compact_release(
+        states_path=args.states or root / "manifests" / "split_manifest.csv",
+        actions_path=args.actions,
+        output_dir=output,
+        metadata={
+            "dataset_version": str(config["version"]),
+            "config_hash": str(config["_config_hash"]),
+            "reward_contract_hash": reward_contract(config)["reward_contract_hash"],
+        },
+        source_split=args.source_split or str(settings["source_split"]),
+        split_fractions=fractions,
+        split_seed=int(args.split_seed if args.split_seed is not None else settings["seed"]),
+        target_column=str(args.target_column),
+        dead_zone_tau=float(
+            args.dead_zone_tau
+            if args.dead_zone_tau is not None
+            else settings["dead_zone_tau"]
+        ),
+        uncertain_weight=float(
+            args.uncertain_weight
+            if args.uncertain_weight is not None
+            else settings["uncertain_weight"]
+        ),
+        chunk_size=int(args.chunk_size if args.chunk_size is not None else settings["chunk_size"]),
+    )
+    _print(summary)
+
+
+def command_cache_embeddings(args: argparse.Namespace) -> None:
+    config, root = _load(args)
+    settings = config["embedding_cache"]
+    release_dir = (
+        Path(args.release_dir).expanduser().resolve()
+        if args.release_dir
+        else root / "release" / args.release_name
+    )
+    summary = cache_state_embeddings(
+        release_dir,
+        embedding_dim=int(
+            args.embedding_dim
+            if args.embedding_dim is not None
+            else settings["embedding_dim"]
+        ),
+        dtype=str(args.dtype or settings["dtype"]),
+        batch_size=int(args.batch_size if args.batch_size is not None else settings["batch_size"]),
+        device=str(args.device),
+        model_dir=args.model_dir,
+        splits=args.split or None,
+        overwrite=bool(args.overwrite),
+    )
+    _print(summary)
+
+
 def command_status(args: argparse.Namespace) -> None:
     _, root = _load(args)
     files = sorted(str(path.relative_to(root)) for path in root.rglob("*.complete.json")) if root.exists() else []
@@ -215,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks.add_argument("--states", default=None)
     tasks.add_argument("--candidates", default=None)
     tasks.add_argument("--output", default=None)
-    tasks.add_argument("--split", action="append", default=["train"])
+    tasks.add_argument("--split", action="append", default=[])
     tasks.add_argument("--repeat-seed", action="append", type=int, default=[])
     tasks.set_defaults(func=command_build_tasks)
 
@@ -270,6 +337,34 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("--release-name", default="sft_actions_v001")
     release.add_argument("--output-dir", default=None)
     release.set_defaults(func=command_release)
+
+    compact = subparsers.add_parser("release-compact")
+    compact.add_argument("--states", default=None)
+    compact.add_argument("--actions", required=True)
+    compact.add_argument("--release-name", default="sft_actions_round0_base")
+    compact.add_argument("--output-dir", default=None)
+    compact.add_argument("--source-split", default=None)
+    compact.add_argument("--train-fraction", type=float, default=None)
+    compact.add_argument("--validation-fraction", type=float, default=None)
+    compact.add_argument("--test-fraction", type=float, default=None)
+    compact.add_argument("--split-seed", type=int, default=None)
+    compact.add_argument("--target-column", default="reward_lcb")
+    compact.add_argument("--dead-zone-tau", type=float, default=None)
+    compact.add_argument("--uncertain-weight", type=float, default=None)
+    compact.add_argument("--chunk-size", type=int, default=None)
+    compact.set_defaults(func=command_release_compact)
+
+    embeddings = subparsers.add_parser("cache-embeddings")
+    embeddings.add_argument("--release-dir", default=None)
+    embeddings.add_argument("--release-name", default="sft_actions_round0_base")
+    embeddings.add_argument("--embedding-dim", type=int, choices=(1280, 2560, 5120), default=None)
+    embeddings.add_argument("--dtype", choices=("float16", "float32"), default=None)
+    embeddings.add_argument("--batch-size", type=int, default=None)
+    embeddings.add_argument("--device", default="auto")
+    embeddings.add_argument("--model-dir", default=None)
+    embeddings.add_argument("--split", action="append", default=[])
+    embeddings.add_argument("--overwrite", action="store_true")
+    embeddings.set_defaults(func=command_cache_embeddings)
 
     status = subparsers.add_parser("status")
     status.set_defaults(func=command_status)

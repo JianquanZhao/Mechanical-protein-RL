@@ -26,6 +26,7 @@ from training import (
     build_agent_config,
     build_dataset,
     configure_stdout_logging,
+    initialize_agent_from_sft_checkpoint,
     iter_training_episode_paths,
     parse_args,
     parse_gpu_ids,
@@ -301,6 +302,12 @@ def train_asynchronously(args: Any) -> None:
         action_dim=AMINO_ACID_ACTION_DIM,
         config=agent_config,
     )
+    if args.sft_checkpoint is not None:
+        initialize_agent_from_sft_checkpoint(
+            agent,
+            args.sft_checkpoint,
+            include_visited_mask=args.include_visited_mask_in_observation,
+        )
     replay_buffer = ReplayBuffer(
         capacity=args.replay_capacity,
         state_shape=state_shape,

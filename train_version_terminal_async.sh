@@ -20,7 +20,18 @@ POSITIVE_SAMPLE_FRACTION="${MPRL_POSITIVE_SAMPLE_FRACTION:-0.25}"
 POSITIVE_REPLAY_RESERVE_FRACTION="${MPRL_POSITIVE_REPLAY_RESERVE_FRACTION:-0.10}"
 POSITIVE_REWARD_LOWER_BOUND="${MPRL_POSITIVE_REWARD_LOWER_BOUND:-${MPRL_POSITIVE_REWARD_THRESHOLD:--0.25}}"
 N_STEP="${MPRL_N_STEP:-3}"
-RUN_LABEL="${MPRL_RUN_LABEL:-async_a${ACTORS}_esm${INFERENCE_BATCH_SIZE}_f${TRAIN_FREQUENCY}_g${GRADIENT_STEPS}_${REPLAY_SAMPLING}_possample${POSITIVE_SAMPLE_FRACTION}_poslcb${POSITIVE_REWARD_LOWER_BOUND}_posreserve${POSITIVE_REPLAY_RESERVE_FRACTION}_n${N_STEP}_stepx${STEP_REWARD_SCALE}_terminalx${TERMINAL_REWARD_SCALE}}"
+SFT_CHECKPOINT="${MPRL_SFT_CHECKPOINT:-}"
+SFT_ARGS=()
+SFT_RUN_SUFFIX=""
+if [[ -n "${SFT_CHECKPOINT}" ]]; then
+  if [[ ! -f "${SFT_CHECKPOINT}" ]]; then
+    echo "SFT checkpoint does not exist: ${SFT_CHECKPOINT}" >&2
+    exit 1
+  fi
+  SFT_ARGS+=(--sft-checkpoint "${SFT_CHECKPOINT}")
+  SFT_RUN_SUFFIX="_sft"
+fi
+RUN_LABEL="${MPRL_RUN_LABEL:-async_a${ACTORS}_esm${INFERENCE_BATCH_SIZE}_f${TRAIN_FREQUENCY}_g${GRADIENT_STEPS}_${REPLAY_SAMPLING}_possample${POSITIVE_SAMPLE_FRACTION}_poslcb${POSITIVE_REWARD_LOWER_BOUND}_posreserve${POSITIVE_REPLAY_RESERVE_FRACTION}_n${N_STEP}_stepx${STEP_REWARD_SCALE}_terminalx${TERMINAL_REWARD_SCALE}${SFT_RUN_SUFFIX}}"
 RUN_DIR="${MPRL_RUN_DIR:-/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/${RUN_LABEL}_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "${RUN_DIR}"
@@ -28,6 +39,7 @@ mkdir -p "${RUN_DIR}"
 nohup "${PROJECT_ROOT}/scripts/supervise_training.sh" "${RUN_DIR}" \
   env PYTHONUNBUFFERED=1 "${PYTHON_BIN}" asynchronous_training.py \
   --mode asynchronous --device cuda:0 \
+  "${SFT_ARGS[@]}" \
   --async-actors "${ACTORS}" \
   --async-inference-gpu-ids "${INFERENCE_GPUS}" \
   --async-inference-batch-size "${INFERENCE_BATCH_SIZE}" \
@@ -93,3 +105,8 @@ echo "Positive replay reserve fraction: ${POSITIVE_REPLAY_RESERVE_FRACTION}"
 echo "Positive reward lower bound: ${POSITIVE_REWARD_LOWER_BOUND}"
 echo "N-step return: ${N_STEP}"
 echo "Revisit prevention: enabled and included in observation"
+if [[ -n "${SFT_CHECKPOINT}" ]]; then
+  echo "Q-head initialization: SFT checkpoint ${SFT_CHECKPOINT}"
+else
+  echo "Q-head initialization: random (set MPRL_SFT_CHECKPOINT for Plan B)"
+fi

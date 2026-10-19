@@ -14,6 +14,7 @@ from training import (
     configure_training_mode,
     data_parallel_batch_plan,
     enable_data_parallel,
+    initialize_agent_from_sft_checkpoint,
     load_resume_checkpoint,
     parse_args,
     run_replay_optimization_event,
@@ -35,6 +36,81 @@ def test_cli_defaults_use_positive_episode_quota_and_weak_shaping(monkeypatch) -
     assert args.positive_reward_threshold == pytest.approx(0.0)
     assert args.n_step == 1
     assert args.step_reward_scale == pytest.approx(0.025)
+    assert args.sft_checkpoint is None
+
+
+def test_sft_checkpoint_initializes_online_and_target_networks(tmp_path) -> None:
+    config = DDQNConfig(
+        hidden_dims=(8,),
+        embedding_dim=1280,
+        device="cpu",
+        seed=17,
+    )
+    source = DDQNAgent(state_shape=(1, 1281), action_dim=20, config=config)
+    with torch.no_grad():
+        for parameter in source.online_network.parameters():
+            parameter.fill_(0.125)
+    checkpoint_path = tmp_path / "best.pt"
+    torch.save(
+        {
+            "checkpoint_type": "mechanical_protein_sft_q_head",
+            "q_network_state_dict": source.online_network.state_dict(),
+            "epoch": 4,
+            "metrics": {"ndcg_macro": 0.66},
+            "architecture": {
+                "embedding_dim": 1280,
+                "hidden_dims": [8],
+                "include_visited_mask": True,
+                "amino_acid_order": "ACDEFGHIKLMNPQRSTVWY",
+                "per_residue_action_dim": 20,
+            },
+        },
+        checkpoint_path,
+    )
+    agent = DDQNAgent(state_shape=(1, 1281), action_dim=20, config=config)
+
+    summary = initialize_agent_from_sft_checkpoint(
+        agent,
+        checkpoint_path,
+        include_visited_mask=True,
+    )
+
+    expected = source.online_network.state_dict()
+    assert summary["epoch"] == 4
+    assert agent.environment_steps == 0
+    assert agent.optimization_steps == 0
+    assert not agent.optimizer.state
+    for name, tensor in agent.online_network.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name])
+    for name, tensor in agent.target_network.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name])
+
+
+def test_sft_checkpoint_rejects_incompatible_visited_mask(tmp_path) -> None:
+    config = DDQNConfig(hidden_dims=(8,), embedding_dim=1280, device="cpu")
+    agent = DDQNAgent(state_shape=(1, 1280), action_dim=20, config=config)
+    checkpoint_path = tmp_path / "best.pt"
+    torch.save(
+        {
+            "checkpoint_type": "mechanical_protein_sft_q_head",
+            "q_network_state_dict": agent.online_network.state_dict(),
+            "architecture": {
+                "embedding_dim": 1280,
+                "hidden_dims": [8],
+                "include_visited_mask": True,
+                "amino_acid_order": "ACDEFGHIKLMNPQRSTVWY",
+                "per_residue_action_dim": 20,
+            },
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(ValueError, match="include_visited_mask"):
+        initialize_agent_from_sft_checkpoint(
+            agent,
+            checkpoint_path,
+            include_visited_mask=False,
+        )
 
 
 def test_cli_accepts_positive_reward_lower_bound(monkeypatch) -> None:

@@ -18,7 +18,12 @@ from torch.utils.data import DataLoader
 
 from model.agent_module.ddqn_agent import QNetwork
 from model.encoding_module.esm2_encoder import ESM2SequenceEncoder
-from model.sft_module import SFTActionDataset, SFTLossConfig, collate_sft_states
+from model.sft_module import (
+    SFTActionDataset,
+    SFTLossConfig,
+    collate_sft_states,
+    validate_sft_ddqn_q_network_compatibility,
+)
 from model.sft_module.trainer import evaluate, train_epoch
 
 
@@ -30,6 +35,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--run-version", default="sft_qhead_v001")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Exact run directory name. Defaults to <run-version>_<timestamp>.",
+    )
     parser.add_argument("--model-root", default=str(DEFAULT_ROOT / "model"))
     parser.add_argument("--log-root", default=str(DEFAULT_ROOT / "log"))
     parser.add_argument("--tensorboard-root", default=str(DEFAULT_ROOT / "tensorboard"))
@@ -38,6 +48,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dims", default="256,256")
     parser.add_argument("--include-visited-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--target-column", default="reward_lcb")
+    parser.add_argument(
+        "--require-cached-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require per-state ESM2 .npy files from the compact release.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--state-batch-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -59,6 +75,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260917)
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--enable-tensorboard", action="store_true")
+    parser.add_argument(
+        "--check-architecture-only",
+        action="store_true",
+        help="Validate SFT/DDQN Q-head compatibility and exit before loading data or ESM2.",
+    )
     return parser.parse_args(argv)
 
 
@@ -90,6 +111,7 @@ def _checkpoint(
     epoch: int,
     metrics: dict[str, float],
     loss_config: SFTLossConfig,
+    architecture_contract: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -107,7 +129,9 @@ def _checkpoint(
                 "amino_acid_order": "ACDEFGHIKLMNPQRSTVWY",
                 "per_residue_action_dim": 20,
             },
+            "q_network_contract": architecture_contract,
             "target_column": args.target_column,
+            "cached_embeddings": bool(args.require_cached_embeddings),
             "loss_config": asdict(loss_config),
             "data_dir": str(Path(args.data_dir).expanduser().resolve()),
         },
@@ -117,7 +141,22 @@ def _checkpoint(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    run_id = f"{args.run_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    hidden_dims = tuple(int(value) for value in args.hidden_dims.split(",") if value.strip())
+    architecture_contract = validate_sft_ddqn_q_network_compatibility(
+        embedding_dim=args.embedding_dim,
+        hidden_dims=hidden_dims,
+        include_visited_mask=args.include_visited_mask,
+    )
+    if args.check_architecture_only:
+        print(json.dumps(architecture_contract, indent=2, sort_keys=True))
+        return 0
+
+    if args.run_id is None:
+        run_id = f"{args.run_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        run_id = str(args.run_id).strip()
+        if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
+            raise ValueError("--run-id must be one non-empty directory name.")
     model_dir = Path(args.model_root).expanduser().resolve() / run_id
     log_dir = Path(args.log_root).expanduser().resolve() / run_id
     tensorboard_dir = Path(args.tensorboard_root).expanduser().resolve() / run_id
@@ -128,8 +167,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         device = torch.device(args.device)
 
-    train_data = SFTActionDataset(args.data_dir, split="train", target_column=args.target_column)
-    validation_data = SFTActionDataset(args.data_dir, split="validation", target_column=args.target_column)
+    dataset_kwargs = {
+        "target_column": args.target_column,
+        "expected_embedding_dim": args.embedding_dim,
+        "require_cached_embeddings": args.require_cached_embeddings,
+    }
+    train_data = SFTActionDataset(args.data_dir, split="train", **dataset_kwargs)
+    validation_data = SFTActionDataset(args.data_dir, split="validation", **dataset_kwargs)
+    test_data = SFTActionDataset(args.data_dir, split="test", **dataset_kwargs)
     generator = torch.Generator().manual_seed(args.seed)
     loader_kwargs = {
         "batch_size": args.state_batch_size,
@@ -138,15 +183,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     train_loader = DataLoader(train_data, shuffle=True, generator=generator, **loader_kwargs)
     validation_loader = DataLoader(validation_data, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_data, shuffle=False, **loader_kwargs)
 
-    encoder = ESM2SequenceEncoder(
-        embedding_dim=args.embedding_dim,
-        device=str(device),
-        mutable_only=True,
-        model_dir=args.esm_model_dir,
+    all_cached = all(
+        dataset.uses_cached_embeddings
+        for dataset in (train_data, validation_data, test_data)
     )
+    encoder = None
+    if not all_cached:
+        encoder = ESM2SequenceEncoder(
+            embedding_dim=args.embedding_dim,
+            device=str(device),
+            mutable_only=True,
+            model_dir=args.esm_model_dir,
+        )
     feature_dim = args.embedding_dim + int(args.include_visited_mask)
-    hidden_dims = tuple(int(value) for value in args.hidden_dims.split(",") if value.strip())
     model = QNetwork((1, feature_dim), 20, hidden_dims=hidden_dims, embedding_dim=args.embedding_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     total_steps = max(1, args.epochs * len(train_loader))
@@ -184,12 +235,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         writer = SummaryWriter(log_dir=str(tensorboard_dir))
     LOGGER.info(
-        "SFT run=%s device=%s train_states=%s validation_states=%s model_dir=%s",
+        "SFT run=%s device=%s train_states=%s validation_states=%s test_states=%s "
+        "cached_embeddings=%s model_dir=%s q_network_contract=%s",
         run_id,
         device,
         len(train_data),
         len(validation_data),
+        len(test_data),
+        all_cached,
         model_dir,
+        architecture_contract,
     )
     best_ndcg = -float("inf")
     stale_epochs = 0
@@ -239,6 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             epoch=epoch,
             metrics=validation_metrics,
             loss_config=loss_config,
+            architecture_contract=architecture_contract,
         )
         ndcg = float(validation_metrics["ndcg_macro"])
         if ndcg > best_ndcg:
@@ -253,6 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 epoch=epoch,
                 metrics=validation_metrics,
                 loss_config=loss_config,
+                architecture_contract=architecture_contract,
             )
         else:
             stale_epochs += 1
@@ -260,9 +317,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             LOGGER.info("Early stopping at epoch=%s best_validation_ndcg=%.6f", epoch, best_ndcg)
             break
     if writer is not None:
+        writer.flush()
+    best_path = model_dir / "best.pt"
+    if best_path.is_file():
+        best_payload = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(best_payload["q_network_state_dict"], strict=True)
+    test_metrics = evaluate(
+        model=model,
+        encoder=encoder,
+        loader=test_loader,
+        device=device,
+        loss_config=loss_config,
+        include_visited=args.include_visited_mask,
+    )
+    LOGGER.info(
+        "test_loss=%.6f test_ndcg=%.6f test_spearman=%.6f test_hit1=%.6f "
+        "test_greedy_reward=%.6f",
+        test_metrics["loss"],
+        test_metrics["ndcg_macro"],
+        test_metrics["spearman_macro"],
+        test_metrics["positive_hit_at_1"],
+        test_metrics["greedy_reward_mean"],
+    )
+    if writer is not None:
+        for key, value in test_metrics.items():
+            writer.add_scalar(f"test/{key}", value, 0)
         writer.close()
     (model_dir / "run_summary.json").write_text(
-        json.dumps({"run_id": run_id, "best_validation_ndcg": best_ndcg}, indent=2) + "\n",
+        json.dumps(
+            {
+                "run_id": run_id,
+                "best_validation_ndcg": best_ndcg,
+                "test_metrics": test_metrics,
+            },
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return 0

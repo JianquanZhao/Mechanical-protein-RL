@@ -63,9 +63,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "statistics": {
         "confidence_level": 0.95,
         "bootstrap_samples": 2000,
-        "positive_noise_boundary": 0.0,
-        "negative_noise_boundary": 0.0,
+        "positive_noise_boundary": 0.01,
+        "negative_noise_boundary": -0.01,
         "target_column": "marginal_reward_scaled",
+    },
+    "release": {
+        "source_split": "train",
+        "fractions": {"train": 0.8, "validation": 0.1, "test": 0.1},
+        "seed": 20260917,
+        "dead_zone_tau": 0.01,
+        "uncertain_weight": 0.25,
+        "chunk_size": 100000,
+    },
+    "embedding_cache": {
+        "embedding_dim": 1280,
+        "dtype": "float16",
+        "batch_size": 4,
     },
     "search": {"beam_width": 3, "candidate_budget": 64, "max_depth": 8},
 }
@@ -118,6 +131,27 @@ def validate_config(config: Mapping[str, Any]) -> None:
     repeat_seeds = [int(value) for value in config["scan"]["repeat_seeds"]]
     if not repeat_seeds or len(set(repeat_seeds)) != len(repeat_seeds):
         raise ValueError("scan.repeat_seeds must contain unique integer seeds.")
+    release = config["release"]
+    release_fractions = release["fractions"]
+    if set(release_fractions) != expected:
+        raise ValueError(f"release.fractions must contain exactly {sorted(expected)}.")
+    if abs(sum(float(value) for value in release_fractions.values()) - 1.0) > 1e-8:
+        raise ValueError("release.fractions must sum to 1.0.")
+    if any(float(value) < 0.0 for value in release_fractions.values()):
+        raise ValueError("release fractions must be non-negative.")
+    if float(release["dead_zone_tau"]) < 0.0:
+        raise ValueError("release.dead_zone_tau must be non-negative.")
+    if not 0.0 <= float(release["uncertain_weight"]) <= 1.0:
+        raise ValueError("release.uncertain_weight must be between 0 and 1.")
+    if int(release["chunk_size"]) <= 0:
+        raise ValueError("release.chunk_size must be positive.")
+    embedding_cache = config["embedding_cache"]
+    if int(embedding_cache["embedding_dim"]) not in {1280, 2560, 5120}:
+        raise ValueError("embedding_cache.embedding_dim must be 1280, 2560, or 5120.")
+    if str(embedding_cache["dtype"]) not in {"float16", "float32"}:
+        raise ValueError("embedding_cache.dtype must be float16 or float32.")
+    if int(embedding_cache["batch_size"]) <= 0:
+        raise ValueError("embedding_cache.batch_size must be positive.")
 
 
 def dataset_root(config: Mapping[str, Any]) -> Path:

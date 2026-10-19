@@ -1,0 +1,46 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Training datasets and generated runtime artifacts
+data/
+datasets/
+output/
+outputs/
+logs/
+runs/
+checkpoints/
+tensorboard/
+wandb/
+
+# Model, replay, and array artifacts
+*.pt
+*.pth
+*.ckpt
+*.joblib
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# Biological source data (tracked fixtures remain tracked)
+*.pdb
+*.fasta
+*.fa
+*.csv
+
+# Accidental package-manager output files
+sft_data_generation/=*

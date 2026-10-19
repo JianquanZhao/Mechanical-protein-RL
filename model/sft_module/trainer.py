@@ -13,13 +13,26 @@ from .losses import SFTLossConfig, compute_sft_loss
 from .metrics import compute_sft_metrics
 
 
-def encode_batch(encoder: Any, batch: Dict[str, Any], *, device: torch.device, include_visited: bool) -> Tensor:
-    arrays = encoder.encode_sequences(batch["sequences"])
-    max_length = int(batch["lengths"].max().item())
-    embedding_dim = int(arrays[0].shape[1])
-    states = torch.zeros((len(arrays), max_length, embedding_dim), dtype=torch.float32, device=device)
-    for index, array in enumerate(arrays):
-        states[index, : len(array)] = torch.from_numpy(array).to(device=device)
+def encode_batch(
+    encoder: Any | None,
+    batch: Dict[str, Any],
+    *,
+    device: torch.device,
+    include_visited: bool,
+) -> Tensor:
+    if "embeddings" in batch:
+        states = batch["embeddings"].to(device=device, dtype=torch.float32)
+    else:
+        if encoder is None:
+            raise ValueError(
+                "Batch has no cached embeddings and no ESM2 encoder was provided."
+            )
+        arrays = encoder.encode_sequences(batch["sequences"])
+        max_length = int(batch["lengths"].max().item())
+        embedding_dim = int(arrays[0].shape[1])
+        states = torch.zeros((len(arrays), max_length, embedding_dim), dtype=torch.float32, device=device)
+        for index, array in enumerate(arrays):
+            states[index, : len(array)] = torch.from_numpy(array).to(device=device)
     if include_visited:
         visited = batch["visited"].to(device=device)
         states = torch.cat((states, visited), dim=-1)
@@ -36,7 +49,7 @@ def move_targets(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
 def train_epoch(
     *,
     model: nn.Module,
-    encoder: Any,
+    encoder: Any | None,
     loader: Iterable[Dict[str, Any]],
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
@@ -70,7 +83,7 @@ def train_epoch(
 def evaluate(
     *,
     model: nn.Module,
-    encoder: Any,
+    encoder: Any | None,
     loader: Iterable[Dict[str, Any]],
     device: torch.device,
     loss_config: SFTLossConfig,
@@ -126,4 +139,3 @@ def evaluate(
     )
     metrics["loss"] = total_loss / max(steps, 1)
     return metrics
-

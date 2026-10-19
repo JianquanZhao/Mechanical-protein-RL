@@ -23,12 +23,17 @@ import time
 from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from model.agent_module.ddqn_agent import DDQNAgent, DDQNConfig, OptimizationResult
+from model.agent_module.ddqn_agent import (
+    AMINO_ACID_ACTION_DIM,
+    DDQNAgent,
+    DDQNConfig,
+    OptimizationResult,
+)
 from model.dataset_module import ProteinStructureDataset
 from model.environment_module.environment import MechanicalProteinEnv
 from model.logging_module.training_logger import TrainingLogger, TrainingLoggerConfig
@@ -45,6 +50,8 @@ RESUME_AGENT_FILENAME = "agent.pt"
 RESUME_REPLAY_FILENAME = "replay_buffer.npz"
 RESUME_STATE_FILENAME = "training_state.json"
 RESUME_STATE_VERSION = 1
+SFT_CHECKPOINT_TYPE = "mechanical_protein_sft_q_head"
+SFT_AMINO_ACID_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -456,6 +463,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--sft-checkpoint",
+        "--sft-q-head-checkpoint",
+        dest="sft_checkpoint",
+        default=None,
+        help=(
+            "Initialize a new DDQN online/target Q head from an SFT best.pt "
+            "checkpoint. Optimizer, replay, epsilon schedule, and counters start fresh."
+        ),
+    )
+    parser.add_argument(
         "--resume-next-episode",
         type=int,
         default=None,
@@ -787,6 +804,95 @@ def unwrapped_state_dict(module: torch.nn.Module) -> dict:
     if isinstance(module, torch.nn.DataParallel):
         return module.module.state_dict()
     return module.state_dict()
+
+
+def initialize_agent_from_sft_checkpoint(
+    agent: DDQNAgent,
+    checkpoint_path: str | Path,
+    *,
+    include_visited_mask: bool,
+) -> dict:
+    """Strictly initialize both DDQN Q networks from an SFT Q-head checkpoint."""
+
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"SFT checkpoint does not exist: {path}")
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"SFT checkpoint must contain a mapping payload: {path}")
+    if payload.get("checkpoint_type") != SFT_CHECKPOINT_TYPE:
+        raise ValueError(
+            "Unsupported SFT checkpoint type: "
+            f"expected={SFT_CHECKPOINT_TYPE!r}, "
+            f"actual={payload.get('checkpoint_type')!r}."
+        )
+
+    architecture = payload.get("architecture")
+    if not isinstance(architecture, Mapping):
+        raise ValueError("SFT checkpoint is missing its architecture metadata.")
+    expected_architecture = {
+        "embedding_dim": int(agent.config.embedding_dim),
+        "hidden_dims": list(agent.config.hidden_dims),
+        "include_visited_mask": bool(include_visited_mask),
+        "amino_acid_order": SFT_AMINO_ACID_ORDER,
+        "per_residue_action_dim": AMINO_ACID_ACTION_DIM,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": architecture.get(key)}
+        for key, expected in expected_architecture.items()
+        if architecture.get(key) != expected
+    }
+    expected_feature_dim = int(agent.config.embedding_dim) + int(
+        bool(include_visited_mask)
+    )
+    if int(agent.state_feature_dim) != expected_feature_dim:
+        mismatches["state_feature_dim"] = {
+            "expected": expected_feature_dim,
+            "actual": int(agent.state_feature_dim),
+        }
+    if mismatches:
+        raise ValueError(
+            "SFT checkpoint architecture is incompatible with the DDQN Q head: "
+            f"{mismatches}."
+        )
+
+    state_dict = payload.get("q_network_state_dict")
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError("SFT checkpoint has no q_network_state_dict weights.")
+    non_finite = [
+        name
+        for name, value in state_dict.items()
+        if not isinstance(value, torch.Tensor) or not bool(torch.isfinite(value).all())
+    ]
+    if non_finite:
+        raise ValueError(
+            "SFT checkpoint contains missing/non-finite tensors: "
+            f"{non_finite[:10]}."
+        )
+
+    online_network = (
+        agent.online_network.module
+        if isinstance(agent.online_network, torch.nn.DataParallel)
+        else agent.online_network
+    )
+    online_network.load_state_dict(state_dict, strict=True)
+    agent.hard_sync_target_network()
+
+    summary = {
+        "path": str(path),
+        "epoch": int(payload.get("epoch", -1)),
+        "metrics": dict(payload.get("metrics", {})),
+        "architecture": dict(architecture),
+    }
+    LOGGER.info(
+        "Initialized DDQN online/target Q heads from SFT checkpoint path=%s "
+        "epoch=%s metrics=%s; optimizer/replay/counters remain fresh",
+        path,
+        summary["epoch"],
+        summary["metrics"],
+    )
+    return summary
 
 
 def save_agent_checkpoint(agent: DDQNAgent, path: Path) -> None:
@@ -1134,6 +1240,11 @@ def validate_training_schedule_args(args: argparse.Namespace) -> None:
         raise ValueError("--resume-next-episode must be >= 0.")
     if args.resume_next_episode is not None and args.resume_checkpoint_dir is None:
         raise ValueError("--resume-next-episode requires --resume-checkpoint-dir.")
+    if args.sft_checkpoint is not None and args.resume_checkpoint_dir is not None:
+        raise ValueError(
+            "--sft-checkpoint initializes a new run and cannot be combined with "
+            "--resume-checkpoint-dir."
+        )
 
 
 def update_schedule_summary(
@@ -1312,6 +1423,12 @@ def train(args: argparse.Namespace) -> None:
             action_dim=env.action_space.n,
             config=agent_config,
         )
+        if args.sft_checkpoint is not None:
+            initialize_agent_from_sft_checkpoint(
+                agent,
+                args.sft_checkpoint,
+                include_visited_mask=args.include_visited_mask_in_observation,
+            )
         replay_buffer = ReplayBuffer(
             capacity=args.replay_capacity,
             state_shape=state.shape,

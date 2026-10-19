@@ -1633,3 +1633,1294 @@ CPU 与 GPU proposal 通过 Parquet 文件交换；
 这样既符合“不干扰当前 RL 代码组织”的约束，也避免立即建立第二份会逐渐漂移的 PyRosetta/reward
 实现。等 schema、adapter 和 contract tests 稳定后，`sft_data_generation/` 可以整体迁移到独立
 仓库，当前 RL 只保留 dataset/checkpoint consumer。
+
+## 2026-09-17：单机 SFT 数据生成与 Q-head 监督训练实现
+
+### 42. 本次实现范围
+
+本次按已确认的代码边界实现了两个彼此独立、可单独运行的阶段：
+
+```text
+Stage 1: sft_data_generation/
+         cleaned PDB -> source/split manifest -> action tasks -> PyRosetta scan
+         -> replicate LCB -> labels -> global beam -> dataset release
+
+Stage 2: train_sft.py + model/sft_module/
+         released states/actions -> frozen ESM2 -> supervised per-residue Q head
+```
+
+没有修改以下在线强化学习代码：
+
+```text
+training.py
+asynchronous_training.py
+model/agent_module/ddqn_agent.py
+model/replay_buffer_module/replay_buffer.py
+```
+
+因此当前 DDQN 行为和已运行基线不受影响。SFT checkpoint 接入 DDQN、A/B/C/D 对照仍作为下一
+阶段单独实现，避免数据生成、监督训练和 RL warm-start 同时变化后无法定位问题。
+
+### 43. 当前 RL 使用的 cleaned PDB 数据
+
+当前 `train_version_terminal_async.sh` 实际指定的数据为：
+
+```text
+PDB directory:
+/mnt/nas/jianquanzhao/data/mprl/pdbs/cath
+
+RL train index:
+/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/indices/train_index.txt
+
+fixed RL validation index:
+/mnt/nas/jianquanzhao/data/mprl/outputs/train/add_terminal_reward_train/indices/val_index.txt
+```
+
+现场核对结果：
+
+```text
+PDB files in directory: 8,557
+RL train index:          7,701 unique entries
+RL validation index:       856 unique entries
+train/validation overlap:    0
+```
+
+SFT source 只读取这7,701个 RL training entries；856个 fixed RL validation entries 被显式保留，
+不参与 SFT 数据生成、监督训练和超参数选择。这样以后 A/B 对照仍可以使用原固定验证集。
+
+目录虽然是 RL 使用的预清洗 PDB 集，但 environment 加载时仍可能删除单个缺少 N/CA/C/O 的残基。
+真实 contract smoke 中，文本 PDB 有33个表面合法残基，而 PyRosetta Pose 为32个残基。因此 source
+manifest 不再仅依赖 PDB 文本顺序，而是通过与 RL 相同的 environment/PyRosetta loader 获得最终
+sequence 和 action length。这避免离线 `position * 20 + aa` 与在线 Pose position 发生偏移。
+
+### 44. 存储目录
+
+已创建用户指定的单机目录：
+
+```text
+/mnt/nas/jianquanzhao/data/mprl/SFT/
+├── data/
+│   ├── source/
+│   └── generated/
+├── model/
+├── log/
+└── tensorboard/
+```
+
+正式数据版本位于 `data/generated/<dataset_version>/`；SFT 模型、训练日志和 TensorBoard 分别按
+`<run_version>_<YYYYmmdd_HHMMSS>` 创建子目录，不依赖另一台机器同步。
+
+### 45. 数据生成实现
+
+新增顶层独立包 `sft_data_generation/`，主要能力如下。
+
+#### 45.1 Source manifest 与 split
+
+`manifest.py` 实现：
+
+1. 读取当前 RL train index；
+2. 通过 environment loader 获取实际 PyRosetta sequence 和 chain count；
+3. 将 WT PDB copy/symlink 到 `data/source`；
+4. exact-sequence dedup，只保留 canonical structure 进入主扫描；
+5. 可选 MMseqs2 sequence-similarity clustering；
+6. 按完整 cluster 做80/10/10 SFT train/validation/test split；
+7. 小样本下只要 cluster 数足够，保证三个非零 split 不为空；
+8. 检查同一 cluster 不跨 split。
+
+生产配置 `configs/base.yaml` 使用 MMseqs2：
+
+```text
+minimum sequence identity = 0.30
+coverage = 0.80
+split seed = 20260917
+```
+
+`configs/smoke.yaml` 使用 exact clustering，仅用于当前服务器未安装 MMseqs2 时做 dependency-light
+smoke test，不能替代最终的 sequence-similarity split。
+
+#### 45.2 Reward contract 与 task
+
+`contract.py` 冻结并哈希：
+
+```text
+20-AA ordering = ACDEFGHIKLMNPQRSTVWY
+local repack radius = 8 A
+perform repack = true
+perform minimize = false
+step reward scale = 0.025
+terminal reward scale = 8.0
+random-forest artifact path and SHA256
+code Git commit
+PDB cleaning parameters
+```
+
+`tasks.py` 对 root state 枚举所有非 no-op、非 visited 的 `L * 19` actions，并用
+`state_id + action_index + repeat_seed + reward_contract_hash` 生成确定性 task ID。重复启动、改变
+worker 数或 shard 数不会改变任务语义。
+
+#### 45.3 PyRosetta scanner
+
+`adapters/rl_contract.py` 是唯一 import `model.*` 的离线文件。它直接复用：
+
+```text
+MechanicalProteinEnv mutation/action mapping
+local repack implementation
+StepRewardCalculator
+MechanicalImprovementTerminalRewardCalculator
+params/hbond_random_forest.joblib
+```
+
+每个 task 从同一 parent PDB 重新 reset，`max_steps=1` 保证 terminal reward 被真实计算，而不是把
+非终止 step 的0误当标签。每条 replicate 同时保存：
+
+```text
+step reward
+marginal terminal reward relative to parent
+absolute terminal reward relative to root
+strength/toughness marginal and absolute delta
+before/after physical predictions
+seven features before/after
+candidate sequence, failure reason and runtime
+raw reward and RL-scaled reward
+```
+
+PyRosetta seed 通过 `numeric.random.rg().set_seed()` 设置，并记录是否成功应用。task 失败只产生
+failure row，不中止整个 shard。每个 shard 使用独立 JSONL progress file，重启时跳过已有 task ID，
+完成后输出 CSV 和 `.complete.json`。
+
+#### 45.4 LCB、标签和 beam
+
+`statistics.py` 保存 replicate rows，并按 state/action 计算 bootstrap mean CI、SD、sign agreement
+和 confidence weight。标签为：
+
+```text
+confirmed_positive
+hard_negative
+near_zero_or_uncertain
+confirmed_negative
+structural_failure
+```
+
+阈值、置信度、bootstrap 次数和目标列均由 YAML 控制。`search.py` 执行每个 root 的全局
+`beam=3`，不是每个 parent 各保留3个 children。下一深度 state 必须拥有已 materialize 的候选 PDB，
+避免只有 sequence 没有结构仍继续搜索。
+
+#### 45.5 Round 1-K 候选
+
+`proposals.py` 接受同机产生的 ESM2/SFT proposal tables，应用 action mask、来源合并、action 去重和
+固定 `M=64` budget；默认至少包含16个确定性随机候选以保持探索覆盖。如果未提供模型 proposal，
+会明确生成 model-free random candidates，不会静默标记为 ESM2/SFT 数据。
+
+#### 45.6 Release
+
+`release.py` 在输出训练集前检查 schema、未知 state 和 cluster leakage，稳定输出：
+
+```text
+states.csv
+actions.csv
+dataset_version.json
+```
+
+CSV/JSONL 是不依赖 PyArrow 的默认交换格式；I/O 同时支持 Parquet，安装 `pyarrow` 后可直接使用
+`.parquet` 后缀。
+
+### 46. SFT Q-head 训练实现
+
+新增：
+
+```text
+train_sft.py
+model/sft_module/dataset.py
+model/sft_module/losses.py
+model/sft_module/metrics.py
+model/sft_module/trainer.py
+```
+
+训练单位为 state，不是独立 action row。variable-length batch 对序列和 `L * 20` 标签做 padding，
+使用 `label_available_mask`，未扫描 action 不会被当成 reward=0。
+
+模型与 DDQN 保持同构：
+
+```text
+frozen ESM2 per-residue embedding (default 1280)
++ visited-position feature
+-> shared residue MLP (default 256, 256)
+-> 20 action scores per residue
+```
+
+联合 loss 为：
+
+```text
+L = 1.0 * listwise KL
+  + 0.5 * positive-vs-negative margin ranking
+  + 0.5 * confidence-weighted Huber regression
+```
+
+训练记录 MAE、RMSE、state-macro Spearman、NDCG、positive hit@1/5/10、greedy regret、greedy
+selected reward 和 Pareto-positive fraction。best checkpoint 以 validation macro NDCG 选择，包含：
+
+```text
+Q-head state_dict
+architecture and 20-AA ordering
+visited-mask configuration
+target column and loss configuration
+dataset path
+best validation metrics
+SFT optimizer/scheduler state for resume
+```
+
+后续 DDQN 初始化只应读取 Q-head 和 compatibility metadata，不继承 SFT optimizer momentum。
+
+### 47. 环境包与迁移方法
+
+提供三份环境文件：
+
+```text
+sft_data_generation/environment-cpu.yaml    PyRosetta 数据生成
+sft_data_generation/environment-train.yaml  ESM2 + Q-head GPU 训练
+sft_data_generation/environment-all.yaml    单机完整流程
+```
+
+另一台 CPU 服务器：
+
+```bash
+conda env create -f sft_data_generation/environment-cpu.yaml
+conda activate mprl-sft-data
+```
+
+GPU SFT 服务器：
+
+```bash
+conda env create -f sft_data_generation/environment-train.yaml
+conda activate mprl-sft-train
+```
+
+本阶段单机完整环境：
+
+```bash
+conda env create -f sft_data_generation/environment-all.yaml
+conda activate mprl-sft
+```
+
+CPU 标签生成的必要包为：
+
+```text
+Python 3.10
+PyRosetta
+NumPy, pandas, SciPy
+scikit-learn 1.6.1
+joblib, PyYAML, tqdm
+MMseqs2
+PyArrow（仅 Parquet 必需）
+```
+
+`params/hbond_random_forest.joblib` 是由 scikit-learn 1.6.1 序列化的。当前 `mprl-vgpt` 使用
+1.7.2，真实 smoke 能完成但会产生 `InconsistentVersionWarning`；正式生成标签必须使用提供的
+1.6.1 pin，避免版本差异导致树模型行为风险。
+
+GPU 训练额外需要：
+
+```text
+PyTorch >= 2.0
+fair-esm == 2.0.0
+TensorBoard
+Matplotlib
+```
+
+GPU SFT 不需要 PyRosetta；CPU generator 不需要 Torch/ESM2。
+
+### 48. 使用方法
+
+准备 source、聚类和 split：
+
+```bash
+bash sft_data_generation/scripts/prepare_source.sh
+```
+
+单机 Round-0 分片扫描：
+
+```bash
+SFT_WORKERS=8 SFT_SHARDS=64 \
+bash sft_data_generation/scripts/run_round0.sh
+```
+
+发布数据后训练 Q head：
+
+```bash
+SFT_RELEASE_DIR=/path/to/sft_actions_v001 \
+SFT_ESM_MODEL_DIR=/mnt/data1/home/jianquanzhao/data/models/esm \
+bash sft_data_generation/scripts/train_sft.sh
+```
+
+详细命令、schema 和目录说明见 `sft_data_generation/README.md`。
+
+### 49. 测试结果
+
+新增纯 CPU 测试：
+
+```text
+tests/test_sft_data_generation.py
+tests/test_sft_module.py
+
+7 passed
+```
+
+覆盖：
+
+```text
+PDB sequence parsing
+action encode/decode round trip
+deterministic task IDs and shard assignment
+bootstrap LCB and action classes
+cluster leakage rejection
+proposal dedup/budget/random coverage
+global beam semantics
+variable-length collate and masks
+joint SFT loss backward
+Q-head train/evaluate loop
+```
+
+现有相关回归测试：
+
+```text
+tests/test_ddqn_agent.py
+tests/test_environment.py
+tests/test_terminal_reward_calculator.py
+
+51 passed
+```
+
+真实 PyRosetta contract smoke：
+
+```text
+PDB: 1a0iA02_2.pdb
+environment sequence before: ACTINPYDGWACQISYMEETPDGSLRPSFVMF
+action: position 1, A -> C
+sequence after: CCTINPYDGWACQISYMEETPDGSLRPSFVMF
+mutation/repack/step reward/random-forest terminal delta: completed
+offline sequence/action assertions: passed
+```
+
+4-PDB pipeline smoke 已在指定 NAS 目录完成：
+
+```text
+dataset root:
+/mnt/nas/jianquanzhao/data/mprl/SFT/data/generated/sft_smoke
+
+source entries: 4
+clusters: 4
+split: train=2, validation=1, test=1
+Round-0 tasks: 21,736 (2 repeat seeds)
+```
+
+三个 shell 脚本均通过 `bash -n`。尚未启动7,701个 proteins 的正式 MMseqs2 聚类和完整
+PyRosetta full scan；当前服务器未安装 MMseqs2，且正式扫描属于长时间 CPU 作业。安装
+`environment-cpu.yaml` 后再运行 production config，避免把 exact smoke split 当作正式实验数据。
+
+### 50. 当前结论
+
+本次实现满足“单机运行、数据生成与 RL 解耦、复用完全相同 reward contract、输出版本化训练数据、
+训练同构 Q head”的目标。最重要的工程验证不是简单 import 成功，而是发现并修复了 PDB 文本残基
+与 PyRosetta 实际 Pose 残基不一致造成的 action-position drift。下一步应先在24个 proteins 上运行
+Round-0 pilot，确认 positive-LCB density、repack repeatability 和 predictor OOD，再决定是否扩展到
+全部7,701个 training proteins；不建议立即提交整批 full scan。
+
+## 2026-09-20：SFT 与 DDQN Q-network 架构对齐及启动脚本
+
+### 51. 当前 RL Q-network 的实际架构
+
+当前异步 RL 启动脚本使用以下网络参数：
+
+```text
+ESM2 model                    esm2_t33_650M_UR50D
+ESM2 per-residue embedding    1280
+visited mask                  1 feature/residue
+Q-head input                  1281 = 1280 + 1
+hidden dimensions             256, 256
+amino-acid actions            20/residue
+Q-head layers                 1281 -> 256 -> ReLU -> 256 -> ReLU -> 20
+```
+
+对于 batch size 为 `B`、序列长度为 `L` 的蛋白，Q-network 输入为
+`[B, L, 1281]`，输出为 `[B, L * 20]`。该网络是共享参数的 per-residue head：同一个
+MLP 独立映射每个残基的特征，因此 `L` 只改变输出动作数量，不改变参数形状。
+
+可训练 Q head 的参数形状与参数量为：
+
+```text
+residue_head.0.weight    [256, 1281]
+residue_head.0.bias      [256]
+residue_head.2.weight    [256, 256]
+residue_head.2.bias      [256]
+residue_head.4.weight    [20, 256]
+residue_head.4.bias      [20]
+total trainable parameters: 399,124
+```
+
+ESM2 encoder 当前保持冻结，不包含在上述399,124个 Q-head 参数中。online Q network 与
+target Q network 均由同一个 `QNetwork` 类构建，架构完全相同，仅参数更新方式不同。
+
+### 52. SFT/DDQN 兼容性保证
+
+SFT 训练不再复制一份近似网络，而是直接实例化 RL 使用的
+`model.agent_module.ddqn_agent.QNetwork`。新增
+`model/sft_module/compatibility.py`，在训练开始前执行以下检查：
+
+1. SFT 和 DDQN 均进入 per-residue 模式；
+2. 完整比较两者 `state_dict` 的名称和参数形状；
+3. 使用 `strict=True` 将 SFT 参数加载到一个不同序列长度的 DDQN network；
+4. 对变长输入执行 forward，并验证输出为 `L * 20`；
+5. 将完整的 `q_network_contract` 写入 SFT checkpoint，便于 RL 加载时审计。
+
+也可以不读取数据、不加载 ESM2，单独检查架构：
+
+```bash
+/home/jianquanzhao/anaconda24/envs/mprl-vgpt/bin/python train_sft.py \
+  --data-dir /tmp/not-used \
+  --embedding-dim 1280 \
+  --hidden-dims 256,256 \
+  --include-visited-mask \
+  --check-architecture-only
+```
+
+本次检查结果为 `1281 -> 256 -> 256 -> 20`、399,124个参数；使用长度37的
+probe protein 时，batch size 2 的输出为 `[2, 740]`，严格 checkpoint 加载通过。
+
+### 53. 一键启动脚本
+
+根目录新增 `train_sft.sh`，默认使用以下目录：
+
+```text
+dataset       /mnt/nas/jianquanzhao/data/mprl/SFT/data/generated/sft_v001/release/sft_actions_v001
+model         /mnt/nas/jianquanzhao/data/mprl/SFT/model/<run_id>
+log           /mnt/nas/jianquanzhao/data/mprl/SFT/log/<run_id>
+tensorboard   /mnt/nas/jianquanzhao/data/mprl/SFT/tensorboard/<run_id>
+ESM2          /mnt/data1/home/jianquanzhao/data/models/esm
+Python        /home/jianquanzhao/anaconda24/envs/mprl-vgpt/bin/python
+```
+
+`model`、`log` 和 `tensorboard` 使用完全相同的 `<run_id>`，默认格式为
+`sft_qhead_v001_YYYYmmdd_HHMMSS`。启动前会检查 release 文件、ESM2 checkpoint、
+PyTorch/CUDA、真实 GPU tensor allocation，以及 SFT/DDQN 架构契约。默认在后台运行并写入
+`train.pid` 和 `train_stdout.log`。
+
+正式 release 就绪后，可使用：
+
+```bash
+SFT_DATA_DIR=/mnt/nas/jianquanzhao/data/mprl/SFT/data/generated/<version>/release/<release> \
+SFT_VISIBLE_GPUS=0 \
+bash train_sft.sh
+```
+
+前台运行并同步查看 stdout：
+
+```bash
+SFT_BACKGROUND=0 \
+SFT_DATA_DIR=/mnt/nas/jianquanzhao/data/mprl/SFT/data/generated/<version>/release/<release> \
+bash train_sft.sh
+```
+
+常用覆盖项包括 `SFT_RUN_VERSION`、`SFT_RUN_ID`、`SFT_EPOCHS`、
+`SFT_STATE_BATCH_SIZE`、`SFT_LEARNING_RATE`、`SFT_WEIGHT_DECAY`、
+`SFT_WARMUP_RATIO`、`SFT_VISIBLE_GPUS` 和 `SFT_DEVICE`。脚本末尾还可追加
+`train_sft.py` 的其他参数。旧入口 `sft_data_generation/scripts/train_sft.sh` 已改为转发到
+根目录脚本，防止两套训练配置发生漂移。
+
+### 54. 测试和当前边界
+
+```text
+bash syntax checks: passed
+Python compile checks: passed
+architecture-only compatibility check: passed
+SFT/DDQN/environment/terminal-reward tests: 59 passed
+git diff whitespace check: passed
+```
+
+当前默认 release 目录尚未生成 `states.csv` 和 `actions.csv`，因此没有启动正式 SFT 长任务。
+这是预期的 fail-fast 行为：脚本会明确提示设置 `SFT_DATA_DIR`，避免在错误或未发布的数据上训练。
+
+## 2026-10-12：SFT 训练代码与 `sft_v001` 数据就绪度审计
+
+### 55. 审计结论
+
+本次结论需要区分“代码实现完成”“数据生成完成”和“可以直接启动正式训练”三个层次：
+
+| 检查对象 | 状态 | 结论 |
+| --- | --- | --- |
+| 独立 SFT Q-head 训练模块 | 已完成 | 网络、损失、指标、checkpoint、TensorBoard 和恢复训练代码均已实现 |
+| SFT/DDQN 架构兼容 | 已通过 | SFT 直接复用 RL 的 `QNetwork`，严格参数加载和变长 forward 均通过 |
+| Round 0 训练集单点突变扫描 | 已完成 | 6145 个训练蛋白、11,873,290 个动作全部执行成功，无失败任务 |
+| validation/test 动作标签 | 未生成 | 当前所有动作标签均属于 train split，不能进行独立验证和测试 |
+| SFT release | 未生成 | 缺少训练入口要求的 `states.csv`、`actions.csv` 和 `dataset_version.json` |
+| 重复松弛与统计 LCB | 未完成 | 每个动作只有一个 seed，当前 `reward_lcb` 实际等于单次 `reward_mean` |
+| SFT checkpoint 自动接入 RL | 未完成 | 当前可训练兼容 checkpoint，但 RL 的 A/B/C/D 实验入口仍需单独接入 |
+
+因此，**SFT 训练代码主体已经完成且网络架构可行，但当前 `sft_v001` 还不能直接用于正式 SFT 训练**。
+它已经完成了规模很大的 Round 0 训练集标签生成，但还处于“聚合后的中间数据”阶段，而不是可发布、可验证的训练数据集。
+
+### 56. 当前 SFT 代码完成了什么
+
+当前 SFT 代码包含以下完整训练链路：
+
+1. `train_sft.py`：参数解析、随机种子、设备选择、数据加载、训练、验证、checkpoint 和 TensorBoard 入口；
+2. `model/sft_module/dataset.py`：按照 state 组织候选动作，并支持不同蛋白长度的 batch collate；
+3. `model/sft_module/losses.py`：组合 listwise KL、pairwise ranking 和 Huber regression；
+4. `model/sft_module/metrics.py`：计算 state-macro Spearman、NDCG、positive@K、top hit rate、greedy regret、MAE/RMSE 和 Pareto-positive 等指标；
+5. `model/sft_module/trainer.py`：冻结 ESM2，只训练 Q head，并实现 AdamW、warmup、cosine learning-rate schedule、梯度裁剪和 early stopping；
+6. `model/sft_module/compatibility.py`：检查 SFT 与 DDQN 的参数名称、形状、输入契约和严格 checkpoint 加载；
+7. `train_sft.sh`：统一数据、模型、日志和 TensorBoard 路径，并执行启动前检查；
+8. `sft_data_generation/`：与 RL 主训练代码分离的 CPU 数据生成、分片执行、恢复、聚合和 release 工具。
+
+SFT 与 RL 当前使用相同的 per-residue Q head：
+
+```text
+ESM2 residue embedding       1280
+visited-position mask           1
+Q-head input dimension       1281
+hidden dimensions         256, 256
+amino-acid action dimension    20
+trainable parameters       399,124
+```
+
+其映射为 `1281 -> 256 -> 256 -> 20`。对长度为 `L` 的蛋白，网络输入为
+`[B, L, 1281]`，输出展平为 `[B, L * 20]`。因此蛋白长度改变不会改变 Q head 参数形状。
+
+本次重新执行了以下验证：
+
+```text
+shell syntax checks: passed
+SFT/DDQN strict architecture compatibility: passed
+variable-length forward probe: passed
+focused pytest suite: 41 passed in 10.24 s
+```
+
+这里的“通过”证明网络和训练模块的程序契约成立，不代表当前 11,873,290 条标签已经满足正式训练的数据条件。
+
+### 57. 当前启动脚本中的明确问题
+
+根目录 `train_sft.sh` 当前连续设置了两次 `PYTHON_BIN`：
+
+```bash
+PYTHON_BIN="${SFT_PYTHON:-/home/jianquanzhao/anaconda24/envs/mprl-vgpt/bin/python}"
+PYTHON_BIN="${SFT_PYTHON:-/home/jianquanzhao/anaconda3_v24/envs/mprl-sft/bin/python}"
+```
+
+第二行覆盖第一行。实机检查结果为：
+
+```text
+/home/jianquanzhao/anaconda24/envs/mprl-vgpt/bin/python      exists, Python 3.10.20
+/home/jianquanzhao/anaconda3_v24/envs/mprl-sft/bin/python   missing
+```
+
+所以即使 release 已经生成，当前不设置 `SFT_PYTHON` 时也会在启动前失败。正式启动前应删除第二次覆盖，或显式设置：
+
+```bash
+SFT_PYTHON=/home/jianquanzhao/anaconda24/envs/mprl-vgpt/bin/python bash train_sft.sh
+```
+
+### 58. `sft_v001` 文件夹的实际组成
+
+当前目录实际结构可概括为：
+
+```text
+sft_v001/
+├── manifests/
+│   ├── source_manifest.csv
+│   ├── split_manifest.csv
+│   └── mmseqs/
+│       ├── sequences.fasta
+│       ├── mmseqs_clusters_all_seqs.fasta
+│       ├── mmseqs_clusters_rep_seq.fasta
+│       ├── mmseqs_clusters_cluster.tsv
+│       └── mmseqs_tmp/
+├── metadata/
+│   ├── config_resolved.yaml
+│   └── reward_contract.json
+└── rounds/
+    └── round_000/
+        └── depth_000/
+            ├── tasks.csv
+            ├── replicates/
+            │   ├── shard_*.jsonl
+            │   ├── shard_*.csv
+            │   └── shard_*.complete.json
+            ├── replicates.csv
+            └── labels.csv
+```
+
+当前没有 `release/`、`frontier.csv` 或 `depth_001` 及更深层目录。
+
+### 59. manifests：蛋白来源、去重和数据划分
+
+`source_manifest.csv` 是 WT 数据清单。每一行对应一个通过清洗的原始蛋白，记录：
+
+- protein/source ID；
+- 原始和物化后的 PDB 路径；
+- 与 PyRosetta pose 对齐后的氨基酸序列和长度；
+- 文件与序列 hash；
+- 是否为重复项及 canonical entry 信息；
+- 数据是否有效以及排除原因。
+
+`split_manifest.csv` 在 source manifest 基础上加入：
+
+- MMseqs sequence cluster；
+- `train`、`validation` 或 `test` split；
+- `state_id`、`root_state_id`、`parent_state_id`、depth 和 visited-position 等搜索状态字段。
+
+数据不是逐条随机划分，而是先按序列相似度聚类，再按 cluster 划分，从而避免同源序列跨 train/validation/test 泄漏。
+
+本次读取到的划分统计为：
+
+| 项目 | 数量 |
+| --- | ---: |
+| source entries | 7701 |
+| 纳入 SFT split | 7694 |
+| 排除/保留给 RL validation | 7 |
+| train proteins | 6145 |
+| validation proteins | 770 |
+| test proteins | 779 |
+| sequence clusters | 5538 |
+| train/validation/test clusters | 4430 / 554 / 554 |
+| cluster 跨 split 泄漏 | 0 |
+
+蛋白长度范围为 26--584 aa，中位数为 89 aa。聚类参数来自
+`config_resolved.yaml`：sequence identity 0.3、coverage 0.8、划分比例 0.8/0.1/0.1、seed 20260917。
+
+`manifests/mmseqs/` 保存聚类输入、代表序列、cluster 映射和临时数据库。它主要用于复现数据划分，不是 `train_sft.py` 直接读取的训练输入。
+
+### 60. metadata：实验配置和 reward 契约
+
+`config_resolved.yaml` 是本次数据生成任务的完整解析后配置，记录目录、beam/depth、候选生成、重复 seed、PyRosetta 和 release 参数。它用于确保离线生成可以复现。
+
+`reward_contract.json` 固化了标签生成规则，包括：
+
+- amino-acid action 顺序；
+- random forest 文件路径和 SHA-256；
+- repack/minimize 设置及局部半径；
+- strength/toughness 到 scalar reward 的组合方式；
+- step/terminal scale；
+- git commit 和整个 contract 的 hash。
+
+当前 reward predictor 为 `params/hbond_random_forest.joblib`；配置启用 repack、未启用 minimize、local radius 为 8、step scale 为 0.025、terminal scale 为 8。该契约应随最终 release 一起保存，防止 SFT label 与 RL reward 定义悄然漂移。
+
+### 61. rounds：动作规划、实际执行和标签聚合
+
+`round_000/depth_000/tasks.csv` 是待执行任务表。每行表示一个：
+
+```text
+state + residue position + mutant amino acid + repeat seed
+```
+
+当前 Round 0 明确只对 `train` split 的 WT state 做 depth=0 全单点突变扫描。6145 个训练蛋白总长度为 624,910 aa；每个位置排除 WT 后有 19 种候选，因此理论动作数为：
+
+```text
+624,910 * 19 = 11,873,290
+```
+
+`tasks.csv` 正好包含 11,873,290 个任务。
+
+`replicates/shard_*.jsonl` 是每个 CPU shard 的追加式进度日志，用于中断恢复；
+`shard_*.csv` 是标准化结果；`shard_*.complete.json` 记录 shard 的任务数、成功数、失败数和耗时。当前 64 个 shard 均存在完成标记，assigned、executed 和 succeeded 均合计为 11,873,290，failed 为 0。
+
+`replicates.csv` 是合并并去重后的原始执行结果。它保留 mutation 前后结构特征、step reward 分量、strength/toughness 变化、终局 reward 以及失败信息，约 39.19 GB。
+
+`labels.csv` 将同一 state/action 的重复实验聚合为一行，预期提供：
+
+- `reward_mean`、`reward_std`、`reward_lcb`、`reward_ucb`；
+- positive/negative/uncertain 标签；
+- confidence weight；
+- strength/toughness delta；
+- Pareto-positive 标记。
+
+当前该文件约 10.24 GB，共 11,873,290 行。
+
+### 62. 全量标签审计结果
+
+对整个 `labels.csv` 进行了流式扫描，而不是只查看头部样本：
+
+| 指标 | 结果 |
+| --- | ---: |
+| finite reward rows | 11,873,290 |
+| covered states/proteins | 6145 / 6145 |
+| confirmed positive | 5,297,874（44.6201%） |
+| confirmed negative | 6,277,043（52.8669%） |
+| near zero or uncertain | 298,373（2.5129%） |
+| scalar reward mean | -0.049894 |
+| Pareto-positive | 24.0748% |
+| `reward_std == 0` | 100% |
+| `reward_lcb == reward_mean` | 100% |
+
+从 Round 0 单点突变标签看，正 reward 动作占 44.62%，因此这里不存在“单点正动作在离线标签中极度稀少”的现象。RL 中观察到的 reward 稀疏或持续为负，更可能来自：
+
+1. 连续多步突变后状态分布与 WT 单点扫描不同；
+2. PyRosetta 结构更新和 predictor 噪声累积；
+3. strength/toughness 的冲突与 toughness 整体下降；
+4. exploration 访问到的动作分布与全扫描标签分布不同；
+5. Q head 尚未学习每个 state 内部的正确动作排序。
+
+当前 scalar reward 均值为负，主要与 toughness delta 的均值更负有关：strength delta 均值约为 -0.001455，而 toughness delta 均值约为 -0.011018。
+
+另一个关键问题是近零标签。全量数据中：
+
+```text
+|reward| <= 1e-12 : 14.4670%
+|reward| <= 1e-3  : 15.0859%
+|reward| <= 1e-2  : 19.3854%
+|reward| <= 5e-2  : 32.4461%
+|reward| <= 1e-1  : 45.5409%
+```
+
+但是只有 2.51% 被标记为 near-zero/uncertain。这意味着约 11.95% 的动作几乎只有浮点数符号差异，却被归入 confirmed positive 或 confirmed negative。若直接用于 ranking/classification loss，模型会被要求学习超出 reward predictor 分辨率的差异。
+
+### 63. 为什么当前 LCB 还不是真正的噪声下置信界
+
+`config_resolved.yaml` 中当前只有：
+
+```yaml
+repeat_seeds: [11]
+```
+
+所以每个 action 的 requested repeat 和 successful repeat 都是 1。由此导致：
+
+- 无法从重复 repack/relax 估计方差；
+- `reward_std` 全部为 0；
+- `reward_lcb` 全部等于 `reward_mean`；
+- “LCB > 0”与“单次 reward > 0”完全相同；
+- 当前 confidence weight 不能表达 PyRosetta/reward predictor 的重复性。
+
+因此 `labels.csv` 虽然具备 LCB 字段格式，但当前不应将其解释成“超过结构松弛噪声后的高置信正样本”。这也是正式 SFT 前最重要的统计边界。
+
+### 64. 为什么当前数据不能直接交给 `train_sft.py`
+
+训练入口读取的是一个稳定 release，而不是直接读取 `rounds/` 中的生成中间文件。期望目录为：
+
+```text
+release/<release_name>/
+├── states.csv
+├── actions.csv
+└── dataset_version.json
+```
+
+三者含义为：
+
+- `states.csv`：state 级信息，包括 split、sequence、结构/state lineage 和 visited positions；
+- `actions.csv`：用于监督的 state/action 标签，只保留训练需要的列；
+- `dataset_version.json`：源数据、reward contract、schema、行数和文件 hash，防止误用不同版本数据；
+
+当前 `sft_v001` 没有 `release/`。此外，现有动作标签 100% 属于 train split；validation 理论上还需评估 1,598,831 个单点动作，test 理论上还需 1,518,119 个。若仅把当前 train labels 打包为 release，validation dataset 会因为找不到可用动作标签而失败，early stopping 和所有 validation ranking 指标也无法计算。
+
+还有一个工程风险：当前 `SFTActionDataset` 分别为 train 和 validation 加载完整 CSV，并在内存中按 state 组织。对 10 GB 级 `actions.csv`，即使生成了 release，也会造成很长的启动时间和很高的内存占用。因此正式训练前还需要 split-specific 文件、Parquet/Arrow，或分块索引式读取，避免同一巨型 CSV 被重复完整加载。
+
+### 65. 可行性判断和推荐顺序
+
+#### 65.1 可以确认可行的部分
+
+1. 用冻结的 ESM2 per-residue embedding 训练 DDQN 的可训练 MLP/Q head，在网络结构上可行；
+2. checkpoint 可以严格加载回同构 DDQN Q network；
+3. Round 0 全扫描同时包含正、负和近零动作，适合学习 state 内动作排序，而不是只学习正样本分类；
+4. 现有 ranking + regression 组合目标和 state-macro 指标与本项目目标一致；
+5. 数据生成与 RL 主代码已经分离，适合独立使用 CPU 资源继续构造标签。
+
+#### 65.2 当前不宜直接开始正式训练的原因
+
+1. 没有 release；
+2. 没有 validation/test action labels；
+3. 单 seed 数据不能提供真实 LCB；
+4. 大量近零动作被浮点数符号错误地当作确定正/负样本；
+5. 巨型 CSV 的双重全量内存加载不适合正式规模；
+6. 只有 WT depth=0 状态，尚未覆盖 RL 会遇到的连续多突变 state；
+7. `train_sft.sh` 默认 Python 路径被不存在的环境覆盖；
+8. SFT checkpoint 尚未通过显式参数接入 RL 的 A/B/C/D 对照实验。
+
+#### 65.3 建议的最小闭环
+
+1. 修正 `train_sft.sh` 的 Python 路径覆盖；
+2. 至少为 validation split 生成动作标签；test 标签保留到最终无偏评估；
+3. 根据重复 repack/relax 的实测波动确定非零 noise floor，将 `|reward| <= epsilon` 设为 uncertain；
+4. 采用两阶段重复策略，避免把 1187 万动作全部重复：先单 seed 扫描，再对 top candidate、near-zero 和 hard negative 使用 3--5 个 seed；
+5. 重新聚合 mean/std/LCB/confidence，生成带 hash 的正式 release；
+6. 将 release 按 split 分文件并采用 Parquet/分块读取，或预先缓存 ESM2 embedding；
+7. 先做小规模 overfit 和 Round 0 pilot，确认 NDCG、positive@K、greedy regret 优于随机基线；
+8. 再按 depth 2/4/8 逐步加入 beam-search state，降低 WT 单点分布与在线 RL 状态分布的差异；
+9. 最后加入显式 `--sft-checkpoint` 等 RL 参数，完成 random initialization 与 SFT initialization 的严格对照。
+
+最终判断：**当前代码证明了 SFT Q-head 路径在工程和架构上成立，`sft_v001` 也完成了高覆盖率的 Round 0 训练标签；但 validation、真实重复 LCB、release 和大规模 I/O 尚未闭环。当前最合理的下一步不是直接启动长时间 SFT，而是先完成可验证的数据 release，再进行小规模 pilot。**
+
+## 2026-10-12：SFT Base Release、Dead Zone 与延迟加载实现
+
+### 66. 本轮问答和决策记录
+
+本轮对上一阶段报告中的五个问题进行了进一步对齐。
+
+#### 66.1 数据集划分
+
+需要先修正一个名词层面的理解：当前 `split_manifest.csv` 并不是直接复制 RL 的
+train/validation/test。其源数据来自 RL 的 `train_index.txt`，RL validation index 被保留在 SFT
+数据生成之外；随后 `prepare-manifest` 已经在这批 RL-train 来源数据内部，按照 MMseqs cluster
+产生了 manifest train/validation/test。
+
+当前真正的问题是：`run_round0.sh` 只对 manifest 的 `train` split 执行了 PyRosetta 全扫描，
+所以只有这 6145 个 state 具有 action/reward label，manifest validation/test 虽然有 state 和序列，
+但没有 action label。
+
+最终严格方案应当是继续生成 manifest validation/test 的动作标签，并直接使用现有 cluster split。
+考虑到重新扫描还需要数天，本轮 Base Version 采用可立即执行的 pilot 方案：
+
+1. 只使用当前已有 label 的 manifest-train states；
+2. 再按照 `cluster_id` 进行一次 80%/10%/10% 嵌套划分；
+3. 新 split 用作 SFT train/validation/test；
+4. 原始 manifest split 保存为 `manifest_split`，防止混淆；
+5. 原始 RL validation 数据仍完全不参与 SFT。
+
+该划分适合 Base Version 的模型选择和流程验证，但不能替代未来在原 manifest validation/test 上的
+严格外部评估。
+
+#### 66.2 SFT 训练目录
+
+确定不再把 10 GB `labels.csv` 原样复制成 `actions.csv`。release 改为 ID-indexed、state-level
+compact 格式；数据生成中间文件和正式训练 release 保持分离。
+
+#### 66.3 近零样本
+
+采用默认 `tau=0.01` 的 dead zone。这里不是断言所有近零值都是浮点错误，而是认为单 seed、零噪声
+边界下的符号不足以构成可信正负监督。规则为：
+
+```text
+confirmed_positive: reward_lcb > +0.01
+confirmed_negative: reward_ucb < -0.01
+uncertain:           其他有限且非结构失败的动作
+```
+
+uncertain 动作不会删除，其 SFT regression target 被映射到0，confidence weight 默认乘以0.25；
+原始 `reward_mean`、strength delta 和 toughness delta 仍完整保存，便于统计分析和指标计算。
+
+#### 66.4 大数据读取
+
+确定采用三层拆分：
+
+1. `states.csv` 只保存 state ID、split、sequence 和相对文件路径；
+2. 每个 state 的 `[L, 20]` target/mask/component arrays 单独保存为压缩 `.npz`；
+3. 每个 state 的 ESM2 `[L, embedding_dim]` 单独保存为 `.npy`。
+
+Dataset 初始化时只读取轻量 ID/path index；真正的 target 和 embedding 由 DataLoader worker 在
+`collate_sft_states` 中按 batch 延迟读取。父进程不再加载千万行动，也不再保存全部 state tensor。
+
+#### 66.5 SFT 与 RL 的关系
+
+继续采用 SFT + RL。Round-0/浅层 beam 数据用于让 Q head 先学习局部 reward landscape，RL 再从
+该初始化探索没有被离线 beam 覆盖的连续多突变状态。SFT-only greedy/beam 应保留为实验基线；
+若未来 SFT-only 与 SFT+RL 表现相同，再据实判断 RL 是否提供额外收益。
+
+### 67. 新的 compact release 格式
+
+新增 `compact_state_v1`：
+
+```text
+release/sft_actions_round0_base/
+├── states.csv
+├── dataset_version.json
+├── release_build_config.json
+├── state_data/
+│   └── <hash-prefix>/<state-hash>.npz
+└── embeddings/
+    └── esm2_1280/<hash-prefix>/<state-hash>.npy
+```
+
+`states.csv` 是轻量索引，包含：
+
+- `state_id`、`protein_id`、`cluster_id`；
+- SFT pilot `split` 和原始 `manifest_split`；
+- sequence、visited positions；
+- `state_data_path`、`embedding_path`、embedding dimension/dtype。
+
+每个 state `.npz` 包含形状为 `[L,20]` 的：
+
+- `targets`：应用 dead zone 后的 SFT target；
+- `reward_means`：未经 dead-zone 归零的原始 mean；
+- `confidence_weights`；
+- `label_codes`；
+- `observed_mask`；
+- `strength_deltas`、`toughness_deltas`。
+
+固定 amino-acid action 顺序不再在每一行重复存储，因此大幅减少 state ID、sequence、label string
+等 CSV 重复字段。`release_build_config.json` 保存源文件、split seed、tau 和 target column；如果对
+同一输出目录使用不同参数重跑，程序会拒绝复用旧 state 文件，避免 silent data drift。
+
+### 68. 流式 release 构建
+
+`sft_data_generation/release.py` 新增：
+
+- `nested_split_states`：按 cluster 对已有标签的 manifest split 做 pilot 嵌套划分；
+- `create_compact_release`：按 chunk 流式读取大型 label CSV；
+- 跨 chunk 的 state group 拼接和非连续 state 检查；
+- action-index 范围和重复检查；
+- dead-zone 重分类、target 零中心化和 uncertain 权重缩放；
+- 每 state 原子写入和中断后同配置复用；
+- split cluster leakage、三 split 覆盖和 label count 检查。
+
+默认只读取 label CSV 中实际需要的列，而不是 materialize 约10 GB的完整 DataFrame。
+
+同时修正 `build-tasks --split` 的 CLI 默认行为。之前 `--split validation` 会在默认 `train` 后继续
+append；现在未指定时才使用 train，显式指定 validation/test 时只生成所要求的 split。
+
+### 69. ESM2 embedding 独立缓存
+
+新增 `sft_data_generation/embeddings.py` 和 CLI `cache-embeddings`：
+
+1. 从 compact `states.csv` 读取 sequence；
+2. 使用现有 `ESM2SequenceEncoder.encode_sequences` 进行变长 batch 推理；
+3. 每个 state 独立保存 `[L,1280]` embedding；
+4. 默认使用 float16 降低磁盘与 DataLoader I/O；
+5. 对已有 cache 检查 shape 和 dtype，可断点复用；
+6. 原子写入，全部完成后更新 `states.csv` 和 `dataset_version.json`；
+7. 训练前可检查 cache 是否 complete、dimension 是否与 Q head 一致。
+
+ESM2 embedding 在 SFT 训练期间保持冻结；训练过程不再每个 epoch 重复执行 ESM2 forward。
+
+### 70. ID-based Dataset 与 collate 延迟读取
+
+`model/sft_module/dataset.py` 新增 `SFTStateReference`。对于 compact release：
+
+- `SFTActionDataset.__init__` 只构建 state ID/path reference；
+- `__getitem__` 返回 reference，不读取 `.npz` 或 `.npy`；
+- `collate_sft_states` 收到一个 batch 的 reference 后再加载 target 和 embedding；
+- 根据 batch 最大长度做 padding；
+- 继续生成 observed/valid/positive/negative/visited masks；
+- legacy `states.csv + actions.csv` 仍保留兼容读取路径。
+
+`model/sft_module/trainer.py` 优先使用 batch 中缓存的 `embeddings`；只有显式关闭 cached embedding
+要求且使用 legacy release 时，才回退到在线 ESM2 encoder。
+
+### 71. 训练入口修改
+
+`train_sft.py` 增加：
+
+- `--require-cached-embeddings/--no-require-cached-embeddings`，默认要求 cache；
+- train、validation、test 三个 ID-based dataset；
+- validation macro NDCG 选择 best checkpoint；
+- 训练结束后重新加载 `best.pt`，只在此时评估一次 test split；
+- test loss、NDCG、Spearman、positive@K、greedy reward 等写入日志和 TensorBoard；
+- `run_summary.json` 保存独立 test metrics。
+
+`train_sft.sh` 已修正重复 `PYTHON_BIN` 覆盖问题，默认 Python 恢复为：
+
+```text
+/home/jianquanzhao/anaconda24/envs/mprl-vgpt/bin/python
+```
+
+默认 release 修改为 `sft_actions_round0_base`。preflight 不再要求训练期间加载 ESM checkpoint，
+而是检查：
+
+- release format 为 `compact_state_v1`；
+- embedding cache 已完成；
+- cached embedding dimension 与 SFT Q head 一致；
+- PyTorch/CUDA 和 Q-head architecture contract 正确。
+
+本轮没有修改 RL environment、replay、agent 更新逻辑或 RL 启动脚本。
+
+### 72. 使用方式
+
+一键构建 compact release 并缓存 ESM2：
+
+```bash
+bash sft_data_generation/scripts/prepare_compact_release.sh
+```
+
+可通过环境变量覆盖关键参数：
+
+```bash
+SFT_ACTIONS=/path/to/labels.csv \
+SFT_RELEASE_NAME=sft_actions_round0_base \
+SFT_EMBEDDING_DEVICE=cuda:0 \
+SFT_EMBEDDING_BATCH_SIZE=4 \
+SFT_EMBEDDING_DTYPE=float16 \
+bash sft_data_generation/scripts/prepare_compact_release.sh
+```
+
+正式训练：
+
+```bash
+bash train_sft.sh
+```
+
+构建脚本分为 `release-compact` 和 `cache-embeddings` 两个显式 CLI stage，因此10 GB labels 转换和
+GPU ESM2 推理可以分别运行和恢复。
+
+### 73. 测试结果和当前边界
+
+完成以下验证：
+
+```text
+Python compile checks: passed
+shell syntax checks: passed
+compact nested cluster split: passed
+chunk-boundary state reconstruction: passed
+tau=0.01 dead-zone classification: passed
+per-state NPZ target export: passed
+per-state NPY embedding cache/reuse: passed
+ID-only Dataset + collate lazy loading: passed
+one-epoch cached-embedding train/validation/test smoke test: passed
+SFT/DDQN strict architecture compatibility: passed
+focused SFT + DDQN + dataset tests: 52 passed in 3.34 s
+```
+
+测试使用 synthetic compact release，没有启动真实 10 GB labels 的完整转换，也没有执行 6145 个
+state 的真实 ESM2 缓存。这两个步骤会产生大量磁盘 I/O 和 GPU 计算，应通过上述脚本作为独立长任务
+运行。当前 Base Version 的 test split 是从已有标签的 manifest-train clusters 中再次划分出来的
+pilot test；后续应为原 manifest validation/test 生成标签，构造严格最终 release。
+
+## Plan B：SFT `best.pt` 初始化 DDQN
+
+### 74. 修改前检查结论
+
+修改前，`train_version_terminal_async.sh` 和 `asynchronous_training.py` **不支持**使用 SFT
+`best.pt` 初始化 DDQN：learner 直接构造随机 Q head，随后将该随机 online network 作为
+`initial_policy_state` 发给所有 actors。
+
+本次使用的 checkpoint 为：
+
+```text
+/mnt/nas/jianquanzhao/data/mprl/SFT/model/sft_qhead_v001_20261014_112424/best.pt
+```
+
+其 architecture metadata 与当前异步训练配置一致：
+
+```text
+embedding_dim: 1280
+visited-mask feature: enabled
+hidden_dims: [256, 256]
+per-residue action dimension: 20
+amino-acid order: ACDEFGHIKLMNPQRSTVWY
+```
+
+### 75. 最小实现方案
+
+`training.py` 新增 `--sft-checkpoint`（别名 `--sft-q-head-checkpoint`）和严格加载函数：
+
+1. 检查文件存在且 `checkpoint_type=mechanical_protein_sft_q_head`；
+2. 严格核对 embedding dimension、hidden dimensions、visited mask、氨基酸顺序和输出维度；
+3. 拒绝包含 NaN/Inf 或缺失参数的 checkpoint；
+4. 用 `strict=True` 将 `q_network_state_dict` 加载到 online Q network；
+5. 立即 hard-sync 到 target Q network；
+6. 不加载 SFT optimizer/scheduler，不恢复 replay、epsilon 进度或 DDQN 计数器；
+7. 禁止同时使用 `--sft-checkpoint` 与 `--resume-checkpoint-dir`，避免混淆“新实验初始化”和
+   “恢复既有 RL 训练”。
+
+`asynchronous_training.py` 在 learner agent 创建后、replay 创建及 worker 启动前执行上述加载。
+因此首次传给 actors 的 `initial_policy_state` 已经是 SFT 权重，后续 actor policy broadcast 和
+普通异步 DDQN 完全沿用原逻辑。
+
+同步 `training.py` 入口也复用了同一个加载函数；没有修改 Q network、loss、PER、n-step、
+target sync 或异步调度逻辑。
+
+### 76. 启动方法
+
+Plan B（当前 `best.pt` initialization + DDQN）：
+
+```bash
+MPRL_SFT_CHECKPOINT=/mnt/nas/jianquanzhao/data/mprl/SFT/model/sft_qhead_v001_20261014_112424/best.pt \
+bash train_version_terminal_async.sh
+```
+
+脚本会在自动生成的 run label 后添加 `_sft`，stdout 启动摘要也会打印 checkpoint 路径。
+如需自定义实验名：
+
+```bash
+MPRL_RUN_LABEL=plan_b_sft_ddqn \
+MPRL_SFT_CHECKPOINT=/mnt/nas/jianquanzhao/data/mprl/SFT/model/sft_qhead_v001_20261014_112424/best.pt \
+bash train_version_terminal_async.sh
+```
+
+不设置 `MPRL_SFT_CHECKPOINT` 时仍为 Plan A 的 random Q initialization，便于保持 A/B 对照。
+也可以直接在 Python 命令中传入：
+
+```text
+--sft-checkpoint /mnt/nas/jianquanzhao/data/mprl/SFT/model/sft_qhead_v001_20261014_112424/best.pt
+```
+
+实际运行日志中应出现：
+
+```text
+Initialized DDQN online/target Q heads from SFT checkpoint ...
+optimizer/replay/counters remain fresh
+```
+
+`run_config.json` 的 `args.sft_checkpoint` 会保存本次使用的绝对/传入路径，便于追溯。
+
+### 77. 验证结果
+
+完成以下验证：
+
+```text
+Python compile checks: passed
+shell syntax check: passed
+CLI --help exposure: passed
+missing checkpoint fail-fast: passed
+focused DDQN/SFT/training/asynchronous tests: 62 passed, 2 skipped
+real best.pt strict load: passed
+real best.pt -> asynchronous ActorPolicy handoff/greedy action probe: passed
+```
+
+真实 checkpoint 的 CPU 探针结果：
+
+```text
+checkpoint epoch: 4
+11-residue batched output shape: (2, 220)
+online-target maximum absolute difference: 0.0
+optimizer state entries: 0
+environment steps: 0
+optimization steps: 0
+actor greedy action for 11 residues: 15 (valid range 0-219)
+```
+
+因此当前 checkpoint 可以直接用于 Plan B。其 SFT validation `NDCG=0.6614`，但
+`Spearman=0.0923`、greedy reward median 为 `0`；这意味着该初始化更适合作为改善早期动作排序和
+正动作命中率的 warm start，不能视为已经解决长期多步策略问题。正式对比时仍应在相同 seed、数据划分、
+环境步数和 validation PDB 上比较 Plan A 与 Plan B 的 greedy validation reward、
+strength/toughness delta、positive fraction 和学习速度。
+
+## 78. Plan D：SFT proposal 与 online-Q mixture 实现方案
+
+### 78.1 核心原则
+
+Plan D 不应只是再次使用 `best.pt` 初始化 DDQN，而是需要同时保留两套 Q head：
+
+- `Q_sft`：从 `best.pt` 加载并全程冻结，只负责提供动作 proposal；
+- `Q_online`：可以同样从 `best.pt` 初始化，但继续接受 DDQN 的在线 TD 更新；
+- `Q_target`：继续按照现有 DDQN 逻辑从 `Q_online` 同步，不与 `Q_sft` 混合。
+
+这样，即使在线 TD 更新逐渐覆盖了初始化参数，actor 仍然可以访问未经修改的原始 SFT 策略。
+
+### 78.2 推荐的第一版：首步硬混合
+
+当前 SFT 数据全部来自 `depth=0` 状态，因此第一版建议只让 SFT 参与每个 episode 的第一个动作：
+
+```text
+rho(t) = 0.5 -> 0.0，线性退火
+
+if validation:
+    action = argmax Q_online
+elif episode_step == 0 and random() < rho(t):
+    action = sample_from_topk(Q_sft, action_mask)
+else:
+    action = epsilon_greedy(Q_online, epsilon)
+```
+
+对应的动作来源概率为：
+
+```text
+P(SFT proposal)      = rho
+P(random exploration) = (1-rho) * epsilon
+P(online greedy)       = (1-rho) * (1-epsilon)
+```
+
+实现时必须先判断 SFT proposal，再执行 epsilon-greedy。如果先判断 epsilon，那么训练初期
+`epsilon=1` 时，SFT 被选中的概率将变为零，无法达到改善早期 replay 的目的。
+
+建议第一轮参数为：
+
+```bash
+--sft-checkpoint best.pt
+--sft-proposal-checkpoint best.pt
+--sft-proposal-start 0.50
+--sft-proposal-end 0.0
+--sft-proposal-decay-steps 369648
+--sft-proposal-top-k 5
+--sft-proposal-temperature 1.0
+--sft-proposal-max-depth 1
+```
+
+其中 `369648 = 7701 proteins * 24 steps * 2 epochs`，表示在大约两个 epoch 内将 proposal
+比例从 50% 线性退火到零。SFT proposal 不建议固定选择 top-1；在有效动作的 top-5 内按照
+softmax 或排名进行采样，可以增加轨迹多样性，避免所有 actor 集中产生少数相同轨迹。
+
+### 78.3 其他可行方案及优缺点
+
+| 方案 | 实现方式 | 优点 | 缺点 |
+|---|---|---|---|
+| 首步硬混合 | SFT 只参与 `episode_step=0` | 与 depth=0 训练分布一致；因果解释清楚；风险最低 | SFT 对后续轨迹的直接影响有限 |
+| 全程硬混合 | 每一步都以 `rho(t)` 选择 SFT 或 online Q | SFT 影响更强；可能更快提高早期 replay 质量 | 多突变状态对 SFT 属于 OOD，可能产生错误 proposal |
+| Episode/actor 分流 | 一部分 episode 或 actor 使用 SFT，其余使用 online Q | 异步架构中实现简单；便于比较不同策略产生的数据 | 整条 SFT 轨迹受到 depth 偏移影响；actor 间数据相关性更强 |
+| Q 值融合 | 使用标准化后的 `alpha*Q_sft + (1-alpha)*Q_online` | 动作变化平滑；每一步综合两种判断 | 两套 Q 的尺度不同，不能直接相加；需要逐状态校准 |
+| 排名融合 | 对两套网络给出的 action rank 加权 | 不受 Q 值绝对尺度影响；通常比数值融合稳定 | 会丢失动作间分数差异；实现和解释更复杂 |
+| SFT 候选、online 重排 | SFT 产生 top-k，online Q 在候选中选择 | 限制探索空间；可逐渐将控制权交给 online Q | 初期 online Q 可能把 SFT 的优质动作重新排到后面 |
+| SFT 替代部分随机探索 | epsilon 分支中用 SFT top-k 替代部分随机动作 | 修改量最小；容易接入现有代码 | SFT 使用率被 epsilon 绑定，无法独立控制和评估 |
+
+首轮实验应优先采用“首步硬混合”。如果它能提升 replay 中的正向样本比例，但复杂状态中的后续动作
+仍然较差，再补充 depth 1/2/4 数据，并逐步扩展为多步或全程混合。
+
+### 78.4 对当前代码的最小修改位置
+
+`training.py`：增加 proposal checkpoint、起止比例、退火步数、top-k、temperature 和最大适用
+depth 参数。原有 `--sft-checkpoint` 继续负责初始化 DDQN online/target Q head。
+
+`asynchronous_training.py`：加载并严格校验冻结的 SFT state dict，在 actor 启动时发送一次静态
+SFT 策略。后续的 policy broadcast 只更新 `Q_online`，不更新 `Q_sft`。
+
+`model/asynchronous_module/runtime.py`：让 `ActorPolicy` 同时持有 `online_network` 和
+`sft_proposal_network`。硬混合分支只运行被选中的网络，以避免不必要的双重前向计算。所有动作都必须
+使用相同的 `action_mask`，包括 no-op、不可突变位置和已访问位置约束。
+
+动作选择函数除返回 action 外，还应记录：
+
+```text
+action_source = sft_topk / online_greedy / random
+proposal_ratio
+sft_rank
+episode_step
+```
+
+ReplayBuffer 的 Bellman 学习逻辑不需要改变。DDQN 本身是 off-policy 算法，可以使用混合行为策略产生的
+transition；PER 的 importance-sampling correction 仍然只负责修正 replay 抽样概率。
+
+### 78.5 日志与 TensorBoard 指标
+
+至少增加以下指标：
+
+```text
+policy/sft_action_fraction
+policy/online_greedy_fraction
+policy/random_action_fraction
+policy/proposal_ratio
+reward/terminal_by_first_action_source
+reward/positive_fraction_by_first_action_source
+replay/sft_source_fraction
+```
+
+还应分别比较由 SFT 首动作和非 SFT 首动作启动的 episode 的 terminal reward、strength delta、
+toughness delta 和 positive fraction，以验证 SFT proposal 是否真的提高了后续轨迹质量。
+
+### 78.6 Validation 设计
+
+固定 greedy validation 的主指标必须只评估在线策略：
+
+```text
+epsilon = 0
+rho = 0
+action = argmax Q_online
+```
+
+否则只能证明“混合行为策略效果更好”，不能证明 DDQN 已经学会并保留了 SFT 带来的优势。可以额外记录
+hybrid validation，但不能用它替代 online-only greedy validation。
+
+建议在相同数据划分、seed、环境步数和验证 PDB 上比较：
+
+```text
+A: random initialization + current DDQN
+B: SFT initialization + current DDQN
+D1: SFT initialization + first-step SFT top-k proposal
+D2: SFT initialization + all-step SFT proposal（后续扩展）
+```
+
+### 78.7 成功判据与停止条件
+
+Plan D 的成功不能只依据 proposal 生效期间 actor reward 上升，而应同时满足：
+
+1. proposal 生效期间，replay 中正向 terminal transition 的比例和质量提高；
+2. `rho` 退火到零后，online-only fixed greedy validation 仍保留提升；
+3. strength 和 toughness 没有出现一项改善、另一项严重下降；
+4. 多个随机 seed 下方向一致，bootstrap confidence interval 支持改善。
+
+如果 proposal 生效期间 reward 提高，但 `rho=0` 后立即回落，说明 SFT 只改善了行为策略，DDQN 并未
+成功吸收这些轨迹。届时应考虑增加辅助 ranking/SFT loss、降低早期 online learning rate、短期冻结部分
+Q head，或调整 replay 中 demonstration 的保留方式，而不是简单延长训练时间。

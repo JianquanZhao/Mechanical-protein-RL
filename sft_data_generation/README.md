@@ -12,8 +12,9 @@ The online RL code does not import this package.
 - CPU generation does not load ESM2. ESM2/SFT proposals can be supplied later
   as a candidate table, while labels always come from PyRosetta plus the
   mechanical predictor.
-- `train_sft.py` consumes only a validated dataset release. It freezes ESM2 and
-  trains a Q head with the same `1280 -> 256 -> 256 -> 20` residue-wise layout
+- `train_sft.py` consumes only a validated compact release. ESM2 embeddings are
+  computed once per state and stored separately; training reads those frozen
+  features and trains the same `1280 -> 256 -> 256 -> 20` residue-wise Q head
   as DDQN.
 
 ## Storage Layout
@@ -60,9 +61,10 @@ TensorBoard. PyRosetta is not required by `train_sft.py`.
 
 ## Prepare Source Data
 
-The production config uses MMseqs2 similarity clustering at 30% identity and
-80% coverage, then assigns entire clusters to SFT train/validation/test. The
-existing RL validation index is reserved and never enters SFT generation.
+The production config starts from the existing RL training index, uses MMseqs2
+similarity clustering at 30% identity and 80% coverage, then assigns entire
+clusters to the manifest train/validation/test splits. The existing RL
+validation index is reserved and never enters SFT generation.
 Source sequences are read through the same environment/PyRosetta loading path
 as RL. This deliberately costs more than PDB text parsing, but it excludes
 residues that the loader removes and therefore keeps every offline action index
@@ -110,21 +112,43 @@ Each proposal table needs `state_id`, `action_index`, `proposal_source` and
 model-free, reproducible random candidate set instead of silently pretending
 that ESM2 or SFT was used.
 
-## Release and Train
+## Compact Release, Embeddings and Train
 
-After combining the state tables and action labels for the desired rounds:
+The current Round-0 scan has labels only for the manifest train split. The base
+release therefore performs a second cluster-level pilot split of that labelled
+subset. It does not claim that the original manifest validation/test proteins
+have labels. The raw 10 GB action table is streamed in chunks and converted to
+one compact `.npz` target file per state. With `dead_zone_tau=0.01`, uncertain
+targets are mapped to zero and downweighted while raw means remain available
+for metrics and auditing.
 
 ```bash
-python -m sft_data_generation.cli --config sft_data_generation/configs/base.yaml release \
-  --states /path/to/all_states.csv \
-  --actions /path/to/all_labels.csv \
-  --release-name sft_actions_v001
+bash sft_data_generation/scripts/prepare_compact_release.sh
 
 bash sft_data_generation/scripts/train_sft.sh
 ```
 
+The release layout is:
+
+```text
+release/sft_actions_round0_base/
+├── states.csv                  # lightweight ID/path index
+├── dataset_version.json        # split, dead-zone and embedding contract
+├── release_build_config.json   # protects resumed exports from config drift
+├── state_data/<shard>/*.npz    # [L,20] targets, masks and component deltas
+└── embeddings/esm2_1280/<shard>/*.npy  # one [L,1280] array per state
+```
+
+`SFTActionDataset` holds only the lightweight references. DataLoader workers
+load state targets and embeddings inside `collate_sft_states`, so neither the
+10 GB action CSV nor all state tensors are resident in the parent process.
+For a final non-pilot release, generate labels for the existing manifest
+validation/test splits and preserve those splits instead of repartitioning the
+already-labelled subset.
+
 The best checkpoint is selected by validation macro NDCG and written to
 `model/<version_timestamp>/best.pt`. It contains Q-head weights, architecture,
-amino-acid ordering, target semantics and validation metrics. It deliberately
-does not modify or initialize DDQN automatically; A/B RL integration remains a
-separate controlled experiment.
+amino-acid ordering, target semantics and validation metrics. After model
+selection, the best checkpoint is evaluated once on the nested SFT test split.
+The code deliberately does not modify or initialize DDQN automatically; A/B RL
+integration remains a separate controlled experiment.
